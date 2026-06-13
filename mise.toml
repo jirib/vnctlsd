@@ -1,0 +1,81 @@
+min_version = "2026.2.4"
+
+[env]
+_.python.venv = { path = "{{ config_root }}/server/.venv", create = true }
+
+[tools]
+python = "3.14"
+go = "latest"
+uv = "latest"
+ruff = "latest"
+
+[tasks.setup]
+description = "Install dependencies and local package in editable mode with dev components"
+dir = "{{ config_root }}/server"
+run = "uv sync"
+
+[tasks.lint]
+description = "Lint the code"
+dir = "{{ config_root }}/server"
+run = "ruff check src/"
+
+[tasks.typecheck]
+description = "Verify type compliance using pyright"
+dir = "{{ config_root }}/server"
+run = "uv run pyright src/"
+
+[tasks.test]
+description = "Run tests"
+dir = "{{ config_root }}/server"
+run = "uv run pytest"
+
+[tasks."install-global"]
+description = "Install the finished application locally into an isolated path"
+dir = "{{ config_root }}/server"
+run = "uv tool install . --force"
+
+[tasks.install-libseccomp-python]
+description = "Build and install upstream libseccomp Python bindings into project venv"
+run = '''
+#!/usr/bin/env bash
+set -eu
+set -o pipefail
+
+PROJECT_DIR="{{ config_root}}"
+VERSION=2.6.0
+URL="https://github.com/seccomp/libseccomp/releases/download/v${VERSION}/libseccomp-${VERSION}.tar.gz"
+BUILD_DIR="{{ config_root }}/server/.build/libseccomp-python"
+VENV_PYTHON="{{ config_root }}/server/.venv/bin/python"
+
+test -x "$VENV_PYTHON" || {
+  echo "Missing project venv: $VENV_PYTHON"
+  echo "Run: uv sync"
+  exit 1
+}
+
+"$VENV_PYTHON" -c 'import seccomp' &> /dev/null && exit 0 || true
+
+sudo dnf install autoconf automake libtool pkgconf-pkg-config python3-devel
+
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR"
+
+if [ ! -f "libseccomp-${VERSION}.tar.gz" ]; then
+  curl -LO "$URL"
+fi
+
+rm -rf "libseccomp-${VERSION}"
+tar -xzf "libseccomp-${VERSION}.tar.gz"
+
+cd "libseccomp-${VERSION}"
+./configure --enable-python
+make
+
+cd src/python
+VERSION_RELEASE="$VERSION" "$VENV_PYTHON" setup.py install
+
+if ! "$VENV_PYTHON" -c 'import seccomp'; then
+  echo "Error: Build libseccomp Python bindings failed!"
+  exit 1
+fi
+'''
