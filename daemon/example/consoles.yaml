@@ -2,6 +2,46 @@ socket_validation:           # global defaults
   trusted_uid: libvirt-qemu
   watch_dir: /run/vnctlsd/
 
+commands:
+  status:
+    cmd: "virsh -c qemu:///system domstate {name}"
+    format: raw
+
+  start:
+    cmd: "virsh -c qemu:///system start {name}"
+    format: raw
+    filter:
+      type: status
+      ok_if: "^Domain .* started"
+      message: "{output}"
+
+  reset:
+    cmd: "virsh -c qemu:///system reboot {name}"
+    format: raw
+    filter:
+      type: status
+      ok_if: "^Domain .* is being rebooted"
+      message: "{output}"
+
+  force_reset:
+    cmd: "virsh -c qemu:///system reset {name}"
+    format: raw
+
+  poweroff:
+    cmd: "virsh -c qemu:///system destroy {name}"
+    format: raw
+    filter:
+      type: status
+      ok_if: "^Domain .* destroyed"
+      message: "{output}"
+
+  snapshots:
+    cmd: "virsh -c qemu:///system snapshot-list {name} --as-json"
+    format: json
+    filter:
+      type: list
+      items: "[].name"
+
 consoles:                    # explicit definitions (highest priority)
   vm-special:
     type: qemu_unix

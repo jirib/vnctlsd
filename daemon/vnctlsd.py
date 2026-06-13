@@ -258,6 +258,154 @@ def match_glob_pattern(path: str, fnmatch_pat: str,
     return m.groupdict()
 
 # ---------------------------------------------------------------------------
+# Command output processing
+#
+# Commands declare:
+#   format: raw | json | lines
+#   filter:
+#     type: string | list | table | status
+#     (type-specific fields)
+#
+# The monitor parses raw output according to format, applies the filter to
+# produce one of four normalized structures, then renders to a terminal
+# string.  The worker never sees raw command output.
+#
+# Normalized structures:
+#   {'type': 'string', 'value': '...'}
+#   {'type': 'list',   'items': ['...', ...]}
+#   {'type': 'table',  'rows': [('Key', 'Value'), ...]}
+#   {'type': 'status', 'ok': bool, 'message': '...'}
+# ---------------------------------------------------------------------------
+
+def _parse_output(raw: str, fmt: str) -> object:
+    """Parse raw command output according to declared format."""
+    fmt = fmt.lower() if fmt else 'raw'
+    if fmt == 'json':
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Command output is not valid JSON: {e}")
+    elif fmt == 'lines':
+        return [l for l in raw.splitlines() if l.strip()]
+    else:  # raw
+        return raw
+
+
+def apply_filter(raw: str, fmt: str,
+                 filter_def: dict | None) -> dict:
+    """
+    Parse raw output and apply filter to produce a normalized structure.
+    If no filter is defined, wraps the parsed output in a string structure.
+    """
+    try:
+        parsed = _parse_output(raw, fmt)
+    except ValueError as e:
+        return {'type': 'string', 'value': f"[parse error: {e}]\n{raw}"}
+
+    if not filter_def:
+        # No filter — sensible defaults per format
+        if fmt == 'lines' and isinstance(parsed, list):
+            return {'type': 'list', 'items': parsed}
+        return {'type': 'string', 'value': str(parsed).strip()}
+
+    out_type = filter_def.get('type', 'string')
+
+    if out_type == 'string':
+        tmpl = filter_def.get('value', '{output}')
+        if isinstance(parsed, dict):
+            try:
+                value = tmpl.format_map({**parsed, 'output': raw.strip()})
+            except KeyError:
+                value = raw.strip()
+        else:
+            value = tmpl.format(output=str(parsed).strip())
+        return {'type': 'string', 'value': value}
+
+    elif out_type == 'list':
+        items_expr = filter_def.get('items', '')
+        if items_expr and isinstance(parsed, list):
+            # "[].fieldname" — extract named field from each list element
+            field = items_expr.lstrip('[].').strip()
+            if field:
+                items = [str(el.get(field, ''))
+                         for el in parsed if isinstance(el, dict)]
+            else:
+                items = [str(el) for el in parsed]
+        elif isinstance(parsed, list):
+            items = [str(el) for el in parsed]
+        else:
+            items = [str(parsed)]
+        return {'type': 'list', 'items': [i for i in items if i]}
+
+    elif out_type == 'table':
+        rows = []
+        row_defs = filter_def.get('rows', [])
+        for row in row_defs:
+            if not isinstance(row, (list, tuple)) or len(row) != 2:
+                continue
+            label, expr = row
+            if isinstance(parsed, dict):
+                try:
+                    value = str(expr).format_map(
+                        {**parsed, 'output': raw.strip()})
+                except KeyError:
+                    value = '?'
+            else:
+                value = str(expr).format(output=str(parsed).strip())
+            rows.append((str(label), value))
+        return {'type': 'table', 'rows': rows}
+
+    elif out_type == 'status':
+        ok_pattern = filter_def.get('ok_if', '')
+        if ok_pattern:
+            ok = bool(re.search(ok_pattern, raw))
+        else:
+            ok = True
+        msg_tmpl = filter_def.get('message', '{output}')
+        if isinstance(parsed, dict):
+            try:
+                message = msg_tmpl.format_map(
+                    {**parsed, 'output': raw.strip()})
+            except KeyError:
+                message = raw.strip()
+        else:
+            message = msg_tmpl.format(output=raw.strip())
+        return {'type': 'status', 'ok': ok, 'message': message}
+
+    # Unknown filter type — fall back to string
+    return {'type': 'string', 'value': str(parsed).strip()}
+
+
+def render_normalized(result: dict) -> str:
+    """Render a normalized structure to a terminal-ready string (\r\n endings)."""
+    t = result.get('type', 'string')
+
+    if t == 'string':
+        return result.get('value', '').rstrip() + '\r\n'
+
+    elif t == 'list':
+        items = result.get('items', [])
+        if not items:
+            return '(empty)\r\n'
+        return ''.join(f"  {item}\r\n" for item in items)
+
+    elif t == 'table':
+        rows = result.get('rows', [])
+        if not rows:
+            return '(empty)\r\n'
+        width = max(len(k) for k, _ in rows)
+        return ''.join(f"  {k:<{width}}  {v}\r\n" for k, v in rows)
+
+    elif t == 'status':
+        prefix = '\u2713' if result.get('ok') else '\u2717'
+        return f"{prefix} {result.get('message', '')}\r\n"
+
+    return str(result) + '\r\n'
+
+
+
+
+# ---------------------------------------------------------------------------
 # Console configuration loader
 # ---------------------------------------------------------------------------
 
@@ -397,6 +545,19 @@ class ConsoleConfigStore:
             except ValueError:
                 log.error("Cannot resolve trusted_uid %r to a uid", uid_name)
                 return None
+
+    def get_command(self, action: str) -> dict | None:
+        """
+        Return the command definition for action from the commands section.
+        Returns None if the action is not defined.
+        Callers must treat an undefined action as denied.
+        """
+        with self._lock:
+            return self._cfg.get('commands', {}).get(action)
+
+    def get_all_commands(self) -> list[str]:
+        with self._lock:
+            return list(self._cfg.get('commands', {}).keys())
 
     def get_watch_dir(self) -> str:
         with self._lock:
@@ -1179,17 +1340,74 @@ def run_monitor(rpc_sock: socket.socket, push_sock: socket.socket,
                                     'seq': msg.get('seq')})
 
             elif mtype == 'CMD_REQ':
-                cmd = msg.get('cmd', [])
-                log.debug("CMD_REQ: %r", cmd)
+                # The worker sends {action, console} — never a raw command.
+                # The monitor validates action against its own config,
+                # builds the command, executes, processes output.
+                # This ensures a compromised worker cannot cause the monitor
+                # to run arbitrary commands as root.
+                action       = msg.get('action', '')
+                console_name = msg.get('console', '')
+
+                cmd_def = console_store.get_command(action)
+                if cmd_def is None:
+                    log.warning("CMD_REQ: unknown action %r from worker "
+                                "(not in consoles.yaml commands section)",
+                                action)
+                    rendered = f"✗ Unknown command: {action!r}\r\n"
+                    ipc_send(rpc_sock, {'type': 'CMD_RESP',
+                                        'rendered': rendered,
+                                        'seq': msg.get('seq')})
+                    continue
+
+                # Validate console_name before substituting into command
+                if not validate_vm_name(console_name):
+                    log.warning("CMD_REQ: invalid console name %r",
+                                console_name)
+                    rendered = "✗ Invalid console name\r\n"
+                    ipc_send(rpc_sock, {'type': 'CMD_RESP',
+                                        'rendered': rendered,
+                                        'seq': msg.get('seq')})
+                    continue
+
+                # Build command from monitor's own config — not from worker
+                cmd_template = cmd_def.get('cmd', '')
                 try:
-                    out = subprocess.check_output(
+                    cmd_str = cmd_template.format(name=console_name)
+                except KeyError as e:
+                    log.error("CMD_REQ: cmd template error for %r: %s",
+                              action, e)
+                    rendered = f"✗ Command template error: {e}\r\n"
+                    ipc_send(rpc_sock, {'type': 'CMD_RESP',
+                                        'rendered': rendered,
+                                        'seq': msg.get('seq')})
+                    continue
+
+                cmd = shlex.split(cmd_str)
+                log.debug("CMD_REQ: action=%r console=%r cmd=%r",
+                          action, console_name, cmd)
+
+                try:
+                    raw = subprocess.check_output(
                         cmd, stderr=subprocess.STDOUT
                     ).decode('utf-8', errors='replace').strip()
                 except subprocess.CalledProcessError as e:
-                    out = f"ERROR: {e.output.decode('utf-8', errors='replace').strip()}"
+                    raw = e.output.decode('utf-8', errors='replace').strip()
                 except Exception as e:
-                    out = f"ERROR: {e}"
-                ipc_send(rpc_sock, {'type': 'CMD_RESP', 'output': out,
+                    raw = f"ERROR: {e}"
+
+                # Apply format + filter → normalized → rendered string
+                fmt        = cmd_def.get('format', 'raw')
+                filter_def = cmd_def.get('filter')
+                try:
+                    normalized = apply_filter(raw, fmt, filter_def)
+                except Exception as e:
+                    log.exception("CMD_REQ: apply_filter failed")
+                    normalized = {'type': 'string', 'value': raw}
+
+                rendered = render_normalized(normalized)
+                log.debug("CMD_REQ: rendered %r", rendered[:80])
+                ipc_send(rpc_sock, {'type': 'CMD_RESP',
+                                    'rendered': rendered,
                                     'seq': msg.get('seq')})
 
             elif mtype == 'SPAWN_REQ':
@@ -1648,14 +1866,24 @@ class MonitorProxy:
         except RuntimeError as e:
             return False, None, str(e)
 
-    def cmd(self, cmd_list: list) -> str:
+    def run_action(self, action: str, console_name: str) -> str:
+        """
+        Ask the monitor to run a management action on a console.
+        The monitor validates action against its own config and builds
+        the command itself — the worker never constructs or passes
+        a command string.
+        Returns a pre-rendered terminal string ready to send to the client.
+        """
         try:
             with self._lock:
-                resp, _ = self._call({'type': 'CMD_REQ',
-                                      'cmd': cmd_list}, 'CMD_RESP')
-            return resp.get('output', '')
+                resp, _ = self._call({
+                    'type':    'CMD_REQ',
+                    'action':  action,
+                    'console': console_name,
+                }, 'CMD_RESP')
+            return resp.get('rendered', '')
         except RuntimeError as e:
-            return f"ERROR: {e}"
+            return f"✗ RPC error: {e}\r\n"
 
 # ---------------------------------------------------------------------------
 # Worker — socket validation (re-validates watcher messages independently)
@@ -2128,8 +2356,11 @@ def handle_client(client_sock: socket.socket,
                 client_sock.sendall(
                     f"\r\n[Detached from {cname}]\r\n".encode())
 
-            elif action in ('status', 'start', 'reset',
-                            'force_reset', 'poweroff'):
+            elif action in console_store.get_all_commands():
+                # Management command from consoles.yaml [commands] section.
+                # Worker only sends {action, console_name} — the monitor
+                # validates the action against its own config and builds
+                # the command itself.
                 if len(parts) < 2:
                     client_sock.sendall(
                         f"Usage: {action} <console_name>\r\n".encode())
@@ -2145,18 +2376,9 @@ def handle_client(client_sock: socket.socket,
                     client_sock.sendall(b"Access denied.\r\n")
                     continue
 
-                # Build virsh command from console cmd template
-                # Extract VM name from console name (best effort)
-                vm_name = cname
-                cmd_map = {
-                    'status':     f"virsh -c qemu:///system domstate {vm_name}",
-                    'start':      f"virsh -c qemu:///system start {vm_name}",
-                    'reset':      f"virsh -c qemu:///system reboot {vm_name}",
-                    'force_reset': f"virsh -c qemu:///system reset {vm_name}",
-                    'poweroff':   f"virsh -c qemu:///system destroy {vm_name}",
-                }
-                result = monitor.cmd(shlex.split(cmd_map[action]))
-                client_sock.sendall(f"{result}\r\n".encode())
+                # Send action + console name to monitor — no command string
+                rendered = monitor.run_action(action, cname)
+                client_sock.sendall(rendered.encode())
 
             else:
                 client_sock.sendall(

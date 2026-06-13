@@ -1,8 +1,8 @@
 # vnctlsd
 
-A privilege-separated virsh serial console dispatcher written in Python,
-inspired by [Conserver](https://www.conserver.com/) but designed for
-KVM/QEMU virtual machines managed by libvirt.
+A privilege-separated KVM/QEMU serial console dispatcher written in Python,
+inspired by [Conserver](https://www.conserver.com/) but designed for virtual
+machines managed by libvirt.
 
 The daemon drives the terminal server-side. The client is a dumb TLS pipe —
 `socat` works on Linux and macOS, and a minimal Go binary (`vnctl`) is
@@ -14,35 +14,49 @@ provided for Windows compatibility.
 
 - **Conserver-style server-driven terminal** — login prompt, command menu,
   and console attach/detach all happen on the server. The client sends raw
-  keystrokes and displays raw output.
+  keystrokes and displays raw output. No protocol knowledge required.
 - **Console fan-out** — multiple users can attach to the same VM console
   simultaneously. Read-write users type; read-only users watch.
 - **Privilege separation** — three processes with distinct trust levels:
-  - **monitor** (root): PAM authentication, virsh spawning, management commands
+  - **monitor** (root): PAM authentication, virsh spawning, management
+    commands — never touches the network socket
   - **worker** (`_vnctlsd`): network socket, client sessions, console hubs
+    — never forks, never execs, never touches arbitrary files
   - **watcher** (`_vnctlsd`): inotify on the socket directory, validates
-    QEMU unix sockets as they appear
+    QEMU unix sockets as they appear — no network access, read-only fs
 - **PAM authentication in isolated subprocesses** — each auth attempt forks
-  a short-lived child. Password memory is freed by the OS on exit; it never
+  a short-lived child. Password memory is freed by the OS on exit and never
   persists in the long-lived monitor process.
 - **landlock + seccomp** — each process is restricted to the minimal
-  filesystem paths and syscalls it actually needs.
+  filesystem paths and syscalls it actually needs, applied after privilege
+  drop and after all library resolution.
 - **Two console delivery modes**:
   - `exec` — daemon spawns `virsh console <vm>` on demand when a user attaches
   - `qemu_unix` — QEMU dials the daemon at VM boot over a unix socket;
-    the hub is live from the first byte, capturing early boot output
+    the hub is live from the first byte, capturing early boot output before
+    any user attaches
 - **Glob-based console patterns** — one pattern covers many VMs:
   `/run/vnctlsd/console-{name}.sock` matches all QEMU sockets and extracts
-  the VM name automatically
-- **ACL resolver** — two-axis access control: console definitions carry
-  `rw`/`ro` lists (usernames, group names, or `*`), and users carry group
-  memberships with roles. Console ACL takes priority; user map role is the
-  fallback.
+  the VM name automatically. Template variables are substituted into ACL
+  lists too: `rw: ["{name}"]` gives read-write access to the user whose
+  username matches the VM name.
+- **Config-driven management commands** — commands are defined in
+  `consoles.yaml` with format parsing and output filters. The monitor
+  validates every command request against its own config before executing;
+  the worker never constructs or passes command strings.
+- **Output processing pipeline** — each command declares its output format
+  (`raw`, `json`, `lines`) and an optional filter that normalizes the output
+  into one of four structured types (`string`, `list`, `table`, `status`)
+  before rendering to the terminal. Raw command output never reaches the client.
+- **Two-axis ACL** — console definitions carry `rw`/`ro` lists (usernames,
+  group names, or `*`). Users carry group memberships with roles. Console ACL
+  takes priority; user map role is the fallback. Template variables from glob
+  captures are substituted before matching.
 - **Hot reload** — `SIGHUP` reloads user map and console config without
   restarting. `SIGUSR1` logs active sessions. `SIGUSR2` reloads and
   disconnects sessions whose access has been revoked.
 - **Rate limiting** — per-username failed login counter with configurable
-  lockout. Constant-time login responses prevent timing-based enumeration.
+  lockout. Constant-time login responses prevent timing-based user enumeration.
 - **TLS termination by frontend** — the daemon speaks plaintext over a unix
   socket. TLS is handled upstream by ghostunnel, stunnel, or HAProxy.
 
@@ -66,7 +80,7 @@ provided for Windows compatibility.
     │ management cmds    │  │ ConsoleHub fan-out │  │ glob pattern match │
     │ config reload      │  │ ACL enforcement    │  │                    │
     │ SIGHUP/USR1/USR2   │  │ rate limiting      │  │ landlock: ro only  │
-    │                    │  │ landlock + seccomp │  │ seccomp: inotify   │
+    │                    │  │ output pipeline    │  │ seccomp: inotify   │
     └────────┬───────────┘  └──────────┬─────────┘  └─────────┬──────────┘
              │    rpc socketpair        │                       │
              │◄────────────────────────►│                       │
@@ -80,12 +94,44 @@ provided for Windows compatibility.
 
 ### Socketpairs
 
-| Name    | Direction          | Purpose                                     |
-|---------|--------------------|---------------------------------------------|
-| `rpc`   | worker ↔ monitor   | AUTH_REQ, CMD_REQ, SPAWN_REQ + responses    |
-| `push`  | monitor → worker   | SESSION_LIST_REQ, ENFORCE_REQ               |
-| `ctl`   | monitor ↔ watcher  | RELOAD_WATCH, WATCHER_READY, WATCHER_ERROR  |
-| `watch` | watcher → worker   | SOCKET_APPEARED, SOCKET_DISAPPEARED         |
+| Name    | Direction          | Purpose                                      |
+|---------|--------------------|----------------------------------------------|
+| `rpc`   | worker ↔ monitor   | AUTH_REQ, CMD_REQ, SPAWN_REQ + responses     |
+| `push`  | monitor → worker   | SESSION_LIST_REQ, ENFORCE_REQ                |
+| `ctl`   | monitor ↔ watcher  | RELOAD_WATCH, WATCHER_READY, WATCHER_ERROR   |
+| `watch` | watcher → worker   | SOCKET_APPEARED, SOCKET_DISAPPEARED          |
+
+### IPC wire format
+
+```
+[1 byte fd_count][4 bytes BE length][JSON payload]
+```
+
+File descriptors (pty master fds for virsh console sessions) travel via
+`SCM_RIGHTS` in the same `sendmsg` call as the payload. Sequence numbers
+in every request/response pair detect stale responses from dead threads and
+poison the channel immediately rather than silently corrupting state.
+
+### Management command flow
+
+The worker never constructs or passes command strings to the monitor:
+
+```
+user types 'status vm-lab01'
+  → worker sends CMD_REQ{action='status', console='vm-lab01'}
+    → monitor validates 'status' against consoles.yaml [commands] section
+    → monitor validates 'vm-lab01' against VM_NAME_RE
+    → monitor builds command: "virsh -c qemu:///system domstate vm-lab01"
+    → monitor executes, parses output (format: raw)
+    → monitor applies filter → normalized structure
+    → monitor renders to terminal string
+    → monitor sends CMD_RESP{rendered='running\r\n'}
+      → worker forwards rendered string to client
+```
+
+A compromised worker sending a crafted `CMD_REQ` with an unknown action
+receives `✗ Unknown command` — the monitor only executes what is defined
+in its own config.
 
 ### Console hub lifecycle
 
@@ -106,7 +152,8 @@ user types '~.' to detach
 ```
 
 For `qemu_unix` consoles the hub is created when QEMU connects at VM boot,
-before any user attaches.
+before any user attaches. Early boot output (BIOS, GRUB, kernel) is captured
+from the first byte.
 
 ---
 
@@ -124,24 +171,23 @@ before any user attaches.
 
 ```bash
 pip install pyyaml python-seccomp
-# or for TOML config:
-pip install tomli   # Python < 3.11 only; 3.11+ has tomllib in stdlib
+# Python < 3.11 only (3.11+ has tomllib in stdlib):
+pip install tomli
 ```
 
-### Service account
+### Service accounts
 
 ```bash
-# Create worker and watcher account
+# Worker and watcher account
 useradd --system --no-create-home --home-dir /nonexistent \
         --shell /sbin/nologin --comment "vnctlsd worker" _vnctlsd
 
-# Create socket group (used to allow ghostunnel/stunnel to connect)
+# Socket group (allows ghostunnel/stunnel to connect)
 groupadd --system _vnctlsd
 usermod -aG _vnctlsd _vnctlsd
 
-# Add your TLS terminator's user to the group if it runs as non-root
-# e.g. for ghostunnel running as 'ghostunnel':
-usermod -aG libvirt _vnctlsd   # so worker can run virsh list
+# Allow worker to run virsh management commands
+usermod -aG libvirt _vnctlsd
 ```
 
 ### Socket directory
@@ -151,8 +197,8 @@ install -d -o root -g _vnctlsd -m 0750 /run/vnctlsd
 ```
 
 The watcher refuses to watch a world-writable directory — it would allow
-any local user to create a fake console socket and capture credentials.
-Permissions must be at most `0770` with a trusted group.
+any local user to create a fake console socket and intercept credentials.
+Permissions must be at most `0770` with a trusted group. `0750` is recommended.
 
 ### Building the client
 
@@ -162,10 +208,10 @@ go mod init vnctl
 go get golang.org/x/term
 go build -o vnctl vnctl.go
 
-# Windows (cross-compile from Linux)
+# Cross-compile for Windows
 GOOS=windows GOARCH=amd64 go build -o vnctl.exe vnctl.go
 
-# macOS
+# Cross-compile for macOS
 GOOS=darwin GOARCH=amd64 go build -o vnctl-macos vnctl.go
 ```
 
@@ -184,9 +230,9 @@ worker_user      = _vnctlsd
 watcher_user     = _vnctlsd
 pidfile          = /run/vnctlsd/vnctlsd.pid
 max_threads      = 64
-hub_grace_period = 30       # seconds to keep hub alive after last client leaves
+hub_grace_period = 30       # seconds hub stays alive after last client leaves
 login_timeout    = 30       # seconds to complete login before disconnect
-idle_timeout     = 300      # seconds of inactivity at prompt before disconnect
+idle_timeout     = 300      # seconds idle at prompt before disconnect
 
 [auth]
 max_failures     = 5        # failed logins before lockout
@@ -206,6 +252,8 @@ users:
   student02:
     groups: [lab-b]
   jbelka:
+    groups: [mentors]
+  admin:
     groups: [mentors, admins]
 
 groups:
@@ -225,9 +273,78 @@ groups:
 # Global socket validation defaults
 socket_validation:
   trusted_uid: libvirt-qemu   # QEMU sockets must be owned by this user
-  watch_dir: /run/vnctlsd/    # directory to watch for QEMU unix sockets
+  watch_dir: /run/vnctlsd/    # directory watched for QEMU unix sockets
 
-# Explicit console definitions (highest priority)
+# Management commands — config-driven, validated by monitor before execution
+# {name} is substituted with the console name (validated against VM_NAME_RE)
+#
+# format: raw | json | lines
+#   raw   — output forwarded as a string
+#   json  — output parsed as JSON (dict or list)
+#   lines — output split on newlines, empty lines dropped
+#
+# filter.type: string | list | table | status
+#   string — render as a single line
+#     value: "{output}"        template over parsed output
+#   list   — render as indented bullet list
+#     items: "[].fieldname"    extract field from each JSON array element
+#   table  — render as key-value table
+#     rows:
+#       - [Label, "{field}"]   each row: label + template over JSON object
+#   status — render as ✓/✗ with message
+#     ok_if: "regex"           regex matched against raw output → ok=true
+#     message: "{output}"      message template
+commands:
+  status:
+    cmd: "virsh -c qemu:///system domstate {name}"
+    format: raw
+
+  start:
+    cmd: "virsh -c qemu:///system start {name}"
+    format: raw
+    filter:
+      type: status
+      ok_if: "^Domain .* started"
+      message: "{output}"
+
+  reset:
+    cmd: "virsh -c qemu:///system reboot {name}"
+    format: raw
+    filter:
+      type: status
+      ok_if: "^Domain .* is being rebooted"
+      message: "{output}"
+
+  force_reset:
+    cmd: "virsh -c qemu:///system reset {name}"
+    format: raw
+
+  poweroff:
+    cmd: "virsh -c qemu:///system destroy {name}"
+    format: raw
+    filter:
+      type: status
+      ok_if: "^Domain .* destroyed"
+      message: "{output}"
+
+  snapshots:
+    cmd: "virsh -c qemu:///system snapshot-list {name} --as-json"
+    format: json
+    filter:
+      type: list
+      items: "[].name"
+
+  info:
+    cmd: "/usr/local/bin/vm-info {name}"
+    format: json
+    filter:
+      type: table
+      rows:
+        - [State,   "{state}"]
+        - [Memory,  "{memory_mb} MB"]
+        - [vCPUs,   "{vcpus}"]
+
+# Explicit console definitions (highest priority over patterns)
 consoles:
   special-vm:
     type: exec
@@ -236,21 +353,21 @@ consoles:
     rw: [admins]
     ro: [mentors]
     validation:
-      trusted_uid: root        # override per-console
+      trusted_uid: root        # per-console override
 
 # Pattern-based definitions (matched when no explicit definition applies)
-# {name} is a capture group — extracted from the socket filename
+# {name} is extracted from the socket filename via glob capture
 console_patterns:
-  # QEMU dials in at VM boot — hub is live before any user attaches
+  # QEMU dials in at VM boot — hub live before any user attaches
   - socket_glob: /run/vnctlsd/console-{name}.sock
     type: qemu_unix
     console_name: "{name}"
     validation:
       trusted_uid: libvirt-qemu
-    rw: ["{name}"]             # username matching VM name gets read-write
-    ro: [mentors]              # mentors group gets read-only
+    rw: ["{name}"]             # username matching VM name → read-write
+    ro: [mentors]              # mentors group → read-only
 
-  # Exec-on-demand: daemon spawns virsh when a user attaches
+  # Exec-on-demand: daemon spawns virsh when user requests console
   - socket_glob: /run/vnctlsd/exec-{name}.sock
     type: exec
     console_name: "{name}"
@@ -260,28 +377,30 @@ console_patterns:
     ro: [mentors]
 ```
 
-#### ACL resolution order
+### ACL resolution order
 
-1. Console definition `rw`/`ro` lists are checked first (most specific)
-2. User map group role is the fallback if no console ACL is defined
+1. Console definition `rw`/`ro` lists (most specific — checked first)
+2. User map group role (fallback when console has no explicit ACL)
 3. `*` in an ACL list matches all authenticated users
 4. Template variables from glob captures are substituted before matching
    (`rw: ["{name}"]` with `name=vm-lab01` → matches username `vm-lab01`)
+5. No match at any level → access denied
 
-#### Socket validation
+### Socket validation
 
 When a socket appears in the watch directory the watcher checks:
 
-1. `lstat` — no symlink following
-2. Must be `S_ISSOCK` — not a regular file or pipe
-3. Owner uid must match `trusted_uid` (resolved to numeric uid)
-4. Must not be world-writable (`S_IWOTH`)
-5. Filename must match a console definition or pattern — unknown sockets
-   are logged and ignored
+1. `lstat` — symlinks are never followed
+2. Must be `S_ISSOCK`
+3. Owner uid must match `trusted_uid` (global default or per-console override,
+   with template variable substitution)
+4. Must not be world-writable (`S_IWOTH`) — use filesystem ACLs for group access
+5. Filename must match a console definition or pattern — unknown sockets are
+   logged and silently ignored
 
 The worker independently re-validates every socket event received from the
-watcher. A compromised watcher cannot cause the worker to connect to an
-untrusted socket.
+watcher before connecting. A compromised watcher cannot cause the worker to
+connect to an untrusted socket.
 
 ---
 
@@ -298,8 +417,9 @@ Configure each VM to connect to a per-VM unix socket at boot:
 </serial>
 ```
 
-Or via `virsh edit vm-lab01`. The daemon listens on the socket; QEMU
-connects when the VM starts. The hub is live from the first BIOS byte.
+The daemon listens on the socket; QEMU connects when the VM starts. The
+hub is live from the first BIOS byte, capturing all output before any user
+attaches.
 
 ---
 
@@ -316,7 +436,7 @@ ghostunnel server \
   --cert server.crt \
   --key server.key \
   --cacert ca.crt \
-  --disable-authentication   # or use --allow-cn for mutual TLS
+  --disable-authentication   # or --allow-cn for mutual TLS
 ```
 
 ### stunnel
@@ -337,17 +457,17 @@ CAfile  = /etc/vnctlsd/ca.crt
 ```bash
 # Start (must be root)
 python3 vnctlsd.py \
-  --config /etc/vnctlsd/vnctlsd.ini \
-  --users  /etc/vnctlsd/users.yaml \
+  --config   /etc/vnctlsd/vnctlsd.ini \
+  --users    /etc/vnctlsd/users.yaml \
   --consoles /etc/vnctlsd/consoles.yaml
 
-# Debug mode — verbose logging with PIDs
+# Debug — verbose logging with PIDs
 python3 vnctlsd.py --config ... --debug
 
 # Disable security restrictions for debugging
-python3 vnctlsd.py --config ... --no-privsep   # disable landlock + seccomp
-python3 vnctlsd.py --config ... --no-seccomp   # disable seccomp only
-python3 vnctlsd.py --config ... --no-landlock  # disable landlock only
+python3 vnctlsd.py --config ... --no-privsep    # disable landlock + seccomp
+python3 vnctlsd.py --config ... --no-seccomp    # disable seccomp only
+python3 vnctlsd.py --config ... --no-landlock   # disable landlock only
 ```
 
 ### Signals
@@ -373,8 +493,8 @@ After=network.target libvirtd.service
 Type=forking
 PIDFile=/run/vnctlsd/vnctlsd.pid
 ExecStart=/usr/bin/python3 /usr/local/sbin/vnctlsd.py \
-    --config /etc/vnctlsd/vnctlsd.ini \
-    --users  /etc/vnctlsd/users.yaml \
+    --config   /etc/vnctlsd/vnctlsd.ini \
+    --users    /etc/vnctlsd/users.yaml \
     --consoles /etc/vnctlsd/consoles.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
@@ -395,26 +515,21 @@ WantedBy=multi-user.target
 # Connect (server drives login prompt)
 vnctl -server avocado:8443
 
-# Skip TLS certificate verification (development only)
+# Skip TLS verification (development only)
 vnctl -server avocado:8443 -insecure
 
-# With CA certificate for server verification
+# With CA certificate
 vnctl -server avocado:8443 -ca ca.crt
 
-# With mutual TLS (client certificate)
+# With mutual TLS
 vnctl -server avocado:8443 -ca ca.crt -cert client.crt -key client.key
 ```
 
-### socat (Linux/macOS, no binary needed)
+### socat (Linux/macOS — no binary needed)
 
 ```bash
-# Basic
 socat $(tty),raw,echo=0 OPENSSL:avocado:8443,verify=0
-
-# With CA verification
 socat $(tty),raw,echo=0 OPENSSL:avocado:8443,cafile=ca.crt
-
-# With mutual TLS
 socat $(tty),raw,echo=0 \
   OPENSSL:avocado:8443,cafile=ca.crt,cert=client.crt,key=client.key
 ```
@@ -434,6 +549,21 @@ vnctlsd> list
   vm-lab01                       live          1 watcher(s)  [read_write]
   vm-lab02                       idle          0 watcher(s)  [read_write]
 
+vnctlsd> status vm-lab01
+running
+
+vnctlsd> snapshots vm-lab01
+  snap-baseline
+  snap-2026-06-13
+
+vnctlsd> info vm-lab01
+  State   running
+  Memory  2048 MB
+  vCPUs   4
+
+vnctlsd> start vm-lab02
+✓ Domain vm-lab02 started
+
 vnctlsd> console vm-lab01
 
 [Attached to vm-lab01 (read-write). Escape: ~. to detach  ~~ for literal ~]
@@ -446,9 +576,6 @@ vm-lab01 login: _
 
 [Detached from vm-lab01]
 
-vnctlsd> status vm-lab01
-running
-
 vnctlsd> quit
 Goodbye.
 ```
@@ -457,10 +584,10 @@ Goodbye.
 
 While attached to a console:
 
-| Sequence | Action                              |
-|----------|-------------------------------------|
-| `~.`     | Detach and return to `vnctlsd>` prompt |
-| `~~`     | Send a literal `~` to the console   |
+| Sequence | Action                                  |
+|----------|-----------------------------------------|
+| `~.`     | Detach and return to `vnctlsd>` prompt  |
+| `~~`     | Send a literal `~` to the console       |
 
 ---
 
@@ -468,13 +595,13 @@ While attached to a console:
 
 ### Privilege separation
 
-| Process   | User         | Capabilities                                      |
-|-----------|--------------|---------------------------------------------------|
-| monitor   | root         | PAM, fork+setuid for virsh, management commands   |
-| worker    | `_vnctlsd`   | Unix socket accept, client I/O, no exec/fork      |
-| watcher   | `_vnctlsd`   | inotify read, lstat — no network, no write        |
+| Process   | User         | Capabilities                                       |
+|-----------|--------------|----------------------------------------------------|
+| monitor   | root         | PAM, fork+setuid for virsh, management commands    |
+| worker    | `_vnctlsd`   | Unix socket accept, client I/O, no exec/fork       |
+| watcher   | `_vnctlsd`   | inotify read, lstat only — no network, no write    |
 
-The monitor is the only process that ever runs as root. It has no network
+The monitor is the only process that ever runs as root and it has no network
 socket access. The worker has network access but cannot fork, exec, or open
 arbitrary files (enforced by seccomp and landlock).
 
@@ -483,28 +610,51 @@ arbitrary files (enforced by seccomp and landlock).
 Each login attempt forks a short-lived child that:
 - Sets `PR_SET_NO_NEW_PRIVS`
 - Limits itself to 0 further processes (`RLIMIT_NPROC=0`)
-- Runs PAM, writes one byte result to a pipe, exits
+- Runs PAM, writes one byte result to a pipe, exits immediately
 
 The password never enters the long-lived monitor's heap. The OS frees the
-child's memory immediately on exit.
+child's memory on exit — no GC delay, no retention.
 
 ### Constant-time login responses
 
 All login failure paths (`bad_credentials`, `not_in_usermap`, `no_role`)
 return the same message (`Login failed.`) after a minimum of 2 seconds.
 This prevents:
-- Username enumeration via error message differences
+- Username enumeration via different error messages
 - Timing attacks that distinguish valid from invalid accounts
 
-The real reason is logged server-side only.
+The real reason is logged server-side only via `log.warning`.
+
+### Command validation in the monitor
+
+The worker sends `{action, console_name}` — never a pre-built command string.
+The monitor:
+1. Validates `action` against its own `consoles.yaml` commands section
+2. Validates `console_name` against `VM_NAME_RE` (`[a-zA-Z0-9_\-.]{1,64}`)
+3. Builds the command from its own template, not from the worker's message
+4. Processes output through the format+filter pipeline before sending back
+
+A compromised worker cannot cause the monitor to run arbitrary commands as root.
+
+### Output processing pipeline
+
+Raw command output never reaches the client. The monitor:
+1. Executes the command
+2. Parses output according to the declared `format` (`raw`/`json`/`lines`)
+3. Applies the `filter` to produce a normalized structure
+4. Renders the structure to a terminal string
+5. Sends only the rendered string back to the worker
+
+This prevents terminal escape injection from malicious command output and
+decouples the client display from command output formats.
 
 ### Socket validation (watcher + worker)
 
 Before connecting to any QEMU unix socket:
 1. `lstat` — symlinks are never followed
 2. Must be `S_ISSOCK`
-3. Owner uid must match configured `trusted_uid`
-4. Must not be world-writable
+3. Owner uid must match configured `trusted_uid` (per-console or global)
+4. Must not be world-writable — use filesystem ACLs for group access
 5. Filename must match a defined console pattern
 
 The worker re-validates independently after receiving events from the watcher.
@@ -513,26 +663,31 @@ A compromised watcher cannot force the worker to connect to an untrusted socket.
 ### Directory permissions
 
 The watch directory must not be world-writable. If it is, the watcher logs
-an error and refuses to watch — a world-writable directory allows any local
-user to create a fake console socket and capture credentials typed into it.
+an error and **refuses to watch** — a world-writable directory allows any
+local user to create a fake console socket and capture credentials typed
+into it by legitimate users.
 
-### landlock (worker)
+### landlock
 
-The worker's filesystem access is restricted to:
-- `/run/vnctlsd/` — unix socket and QEMU console sockets
-- `/dev/` — `/dev/null`, `/dev/urandom`, pty devices
+Worker filesystem access restricted to:
+- `/run/vnctlsd/` — unix socket and QEMU console sockets (read-write)
+- `/dev/` — `/dev/null`, `/dev/urandom`, pty devices (read-write)
 
-The watcher's filesystem access is restricted to:
+Watcher filesystem access restricted to:
 - Watch directory — read-only
 
 ### seccomp
 
-Worker syscall whitelist covers only socket I/O, threading primitives,
-and memory management. Notable absences: `fork`, `execve`, `setuid`,
-`openat` (blocked by both seccomp and landlock), `inotify_*`.
+Worker whitelist covers socket I/O, threading primitives, memory management,
+and `connect` (for QEMU unix socket connections). No `fork`, `execve`,
+`setuid`, `openat` (blocked by both seccomp and landlock), `inotify_*`.
 
-Watcher syscall whitelist covers only `inotify_*`, `lstat`, `openat` (for
-directory scan), and IPC. No network syscalls.
+Watcher whitelist covers `inotify_*`, `lstat`, `openat` (for directory scan),
+and IPC. No network syscalls whatsoever.
+
+Restrictions are applied after privilege drop and after all library resolution
+(`ctypes.util.find_library` needs `/tmp`; this must complete before landlock
+is applied).
 
 ---
 
@@ -547,16 +702,16 @@ attack surface. Separating them gives each a minimal, auditable syscall set.
 
 **Why server-driven terminal instead of a line protocol?**
 
-A line protocol requires the client to understand the protocol — token flow,
-command dispatch, management menu. That logic must be correct on every
-platform including Windows. By moving all logic to the server, the client
-becomes a dumb pipe (70 lines of Go) and the server becomes the single
-point of correctness. Any TLS raw-socket tool works as a client.
+A line protocol requires the client to understand commands, token flow, and
+management menus — logic that must be correct on every platform including
+Windows. By moving all logic to the server, the client becomes a dumb pipe
+(74 lines of Go) and any TLS raw-socket tool works. The server is the single
+point of correctness.
 
-**Why unix sockets instead of TCP for QEMU?**
+**Why unix sockets instead of TCP for QEMU console delivery?**
 
 Unix sockets allow identity validation via `lstat` ownership checks. TCP
-connections carry no inherent identity — any process on the host (or network)
+connections carry no inherent identity — any process on the host or network
 could connect. Unix sockets with strict directory permissions restrict
 connection to processes running as the configured `trusted_uid`.
 
@@ -565,15 +720,31 @@ connection to processes running as the configured `trusted_uid`.
 A lab with 30 students and 30 VMs should not require 30 identical config
 blocks. A single pattern `/run/vnctlsd/console-{name}.sock` with
 `rw: ["{name}"]` covers all of them: the student whose username matches the
-VM name gets read-write access, and the mentors group gets read-only.
+VM name gets read-write access automatically.
 
 **Why PAM in a subprocess?**
 
-Python has no `explicit_bzero` equivalent. Passwords stored in Python
-strings remain in heap memory until the garbage collector runs — which may
-be never for a long-lived daemon. A subprocess whose only job is PAM
-authentication has its entire memory freed by the OS on exit, regardless of
-GC. This is the same approach used by OpenSSH's privilege separation.
+Python has no `explicit_bzero` equivalent. Passwords in Python strings remain
+in heap memory until GC — which may be never for a long-lived daemon. A
+subprocess whose only job is PAM has its entire memory freed by the OS on
+exit, regardless of GC. This mirrors OpenSSH's privilege separation approach.
+
+**Why does the monitor validate commands instead of trusting the worker?**
+
+The worker is the network-facing process — the most likely target for
+exploitation. If the worker is compromised, it should not be able to cause
+the root monitor to execute arbitrary commands. By validating `{action,
+console_name}` against its own config and building the command itself, the
+monitor ensures it only ever runs what was explicitly configured, regardless
+of what the worker sends.
+
+**Why a format+filter output pipeline?**
+
+Management commands return different output formats (plain strings, JSON,
+multi-line tables). Parsing and normalizing in the monitor means the worker
+never sees raw command output — preventing terminal escape injection — and
+the client always receives clean, consistently formatted text. Adding a new
+command with structured output requires only config changes, no code changes.
 
 ---
 
@@ -583,7 +754,7 @@ GC. This is the same approach used by OpenSSH's privilege separation.
 /etc/vnctlsd/
   vnctlsd.ini       daemon configuration
   users.yaml        user → group → role mapping
-  consoles.yaml     console definitions and patterns
+  consoles.yaml     console definitions, patterns, commands, socket validation
   server.crt        TLS certificate (for ghostunnel/stunnel)
   server.key        TLS private key
   ca.crt            CA certificate
@@ -591,13 +762,13 @@ GC. This is the same approach used by OpenSSH's privilege separation.
 /run/vnctlsd/       runtime directory (root:_vnctlsd, mode 0750)
   vnctlsd.sock      client-facing unix socket (ghostunnel connects here)
   vnctlsd.pid       monitor PID
-  console-*.sock    QEMU serial console sockets (created by QEMU)
+  console-*.sock    QEMU serial console sockets (created by QEMU at VM boot)
 
 /usr/local/sbin/
-  vnctlsd.py        daemon
+  vnctlsd.py        daemon (~2900 lines, Python 3.11+)
 
 /usr/local/bin/
-  vnctl             client binary
+  vnctl             client binary (~74 lines, Go)
 ```
 
 ---
@@ -605,13 +776,15 @@ GC. This is the same approach used by OpenSSH's privilege separation.
 ## Limitations
 
 - Linux only (landlock, seccomp, inotify, SCM_RIGHTS, TIOCSCTTY)
-- x86_64 only for inotify syscall numbers (constants hardcoded; ARM64 has
-  different numbers — trivial to add)
+- x86_64 only for raw inotify syscall numbers (hardcoded; ARM64 has different
+  numbers — trivial to add as a platform-detected constant)
 - No VNC/SPICE console support (serial consoles only)
-- No multi-host support (single daemon instance)
-- No session logging / console output capture (planned)
-- LDAP/AD backend for user map not yet implemented (ACLResolver abstraction
-  is in place; FileACLResolver is the only current implementation)
+- No multi-host support (single daemon instance per host)
+- No session logging / console output capture to file (planned)
+- LDAP/AD backend for user map not yet implemented (the `ACLResolver`
+  abstraction is in place; `FileACLResolver` is the only current backend)
+- `qemu_unix` console patterns require QEMU to be configured to use unix
+  socket serial output (libvirt domain XML change per VM)
 
 ---
 
