@@ -1,0 +1,28 @@
+socket_validation:           # global defaults
+  trusted_uid: libvirt-qemu
+  watch_dir: /run/vnctlsd/
+
+consoles:                    # explicit definitions (highest priority)
+  vm-special:
+    type: qemu_unix
+    socket: /run/vnctlsd/console-vm-special.sock
+    validation:
+      trusted_uid: root      # override for this console
+    rw: [admin]
+    ro: []
+
+console_patterns:            # glob-based (matched when no explicit def)
+  - socket_glob: /run/vnctlsd/console-{name}.sock
+    type: qemu_unix
+    console_name: "{name}"
+    validation:
+      trusted_uid: libvirt-qemu
+    rw: ["{name}"]
+    ro: [mentors]
+
+  - socket_glob: /run/vnctlsd/exec-{name}.sock
+    type: exec
+    console_name: "{name}"
+    cmd: "virsh -c qemu:///system console {name} --force"
+    rw: ["{name}"]
+    ro: [mentors]

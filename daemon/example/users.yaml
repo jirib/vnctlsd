@@ -1,0 +1,11 @@
+users:
+  student01:
+    groups: [lab-a]
+  jbelka:
+    groups: [mentors]
+
+groups:
+  lab-a:
+    role: read_write
+  mentors:
+    role: read_only
