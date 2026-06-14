@@ -45,7 +45,7 @@ test -x "$VENV_PYTHON" || {
 
 "$VENV_PYTHON" -c 'import seccomp' &> /dev/null && exit 0 || true
 
-sudo dnf -q -y --allowerasing --allow-downgrade install \
+sudo dnf -q -y install --allowerasing --allow-downgrade \
     autoconf \
     automake \
     gcc \
