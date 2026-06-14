@@ -48,14 +48,16 @@ test -x "$VENV_PYTHON" || {
 sudo dnf -q -y install --allowerasing --allow-downgrade \
     autoconf \
     automake \
+    curl \
     gcc \
+    gperf \
+    gzip \
     libtool \
     make \
     pkgconf-pkg-config \
     python3-devel \
-    curl \
     tar \
-    gzip
+    valgrind
 
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
