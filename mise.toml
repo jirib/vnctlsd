@@ -2,6 +2,7 @@ min_version = "2026.2.4"
 
 [env]
 _.python.venv = { path = "{{ config_root }}/server/.venv", create = true }
+_.path = "{{config_root}}/.bin"
 
 [tools]
 python = "3.14"
@@ -9,32 +10,21 @@ go = "latest"
 uv = "latest"
 ruff = "latest"
 
-[tasks.setup]
-description = "Install dependencies and local package in editable mode with dev components"
-dir = "{{ config_root }}/server"
-run = "uv sync"
 
-[tasks.lint]
-description = "Lint the code"
-dir = "{{ config_root }}/server"
-run = "ruff check src/"
 
-[tasks.typecheck]
-description = "Verify type compliance using pyright"
-dir = "{{ config_root }}/server"
-run = "uv run pyright src/"
+# setup
 
-[tasks.test]
-description = "Run tests"
-dir = "{{ config_root }}/server"
-run = "uv run pytest"
+[tasks."setup:go"]
+description = "Setup Go with dev components"
+dir = "{{ config_root }}/client/vnctl"
+run = "go mod tidy"
 
-[tasks."install-global"]
-description = "Install the finished application locally into an isolated path"
+[tasks."setup:python:dev"]
+description = "Setup Python with dev components"
 dir = "{{ config_root }}/server"
-run = "uv tool install . --force"
+run = "uv sync --group dev"
 
-[tasks.install-libseccomp-python]
+[tasks."setup:python:libseccomp"]
 description = "Build and install upstream libseccomp Python bindings into project venv"
 run = '''
 #!/usr/bin/env bash
@@ -55,7 +45,17 @@ test -x "$VENV_PYTHON" || {
 
 "$VENV_PYTHON" -c 'import seccomp' &> /dev/null && exit 0 || true
 
-sudo dnf install autoconf automake libtool pkgconf-pkg-config python3-devel
+sudo dnf install \
+    autoconf \
+    automake \
+    gcc \
+    libtool \
+    make \
+    pkgconf-pkg-config \
+    python3-devel \
+    curl \
+    tar \
+    gzip
 
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
@@ -79,3 +79,104 @@ if ! "$VENV_PYTHON" -c 'import seccomp'; then
   exit 1
 fi
 '''
+
+[tasks."setup:python"]
+depends = [
+    "setup:python:dev",
+    "setup:python:libseccomp"
+]
+
+[tasks.setup]
+depends = [
+    "setup:go",
+    "setup:python"
+]
+
+
+# lint & typecheck
+
+[tasks.lint]
+description = "Lint the code"
+dir = "{{ config_root }}/server"
+run = "ruff check src/"
+
+[tasks.typecheck]
+description = "Verify type compliance using pyright"
+dir = "{{ config_root }}/server"
+run = "uv run pyright src/"
+
+
+# tests
+
+[tasks.tests]
+description = "Run tests"
+dir = "{{ config_root }}/server"
+run = "uv run pytest"
+
+
+# build
+
+[tasks."build:vnctl:linux-amd64"]
+description = "Build vnctl for Linux (amd64)"
+dir = "{{ config_root }}/client/vnctl"
+run = "GOOS=linux GOARCH=amd64 go build -o ../../build/bin/vnctl-linux-amd64 main.go"
+
+[tasks."build:vnctl:windows-amd64"]
+description = "Build vnctl for Windows (amd64)"
+dir = "{{ config_root }}/client/vnctl"
+run = "GOOS=windows GOARCH=amd64 go build -o ../../build/bin/vnctl-windows-amd64.exe main.go"
+
+[tasks."build:vnctl:mac-intel"]
+description = "Build vnctl for older Intel Macs (amd64)"
+dir = "{{ config_root }}/client/vnctl"
+run = "GOOS=darwin GOARCH=amd64 go build -o ../../build/bin/vnctl-darwin-amd64 main.go"
+
+[tasks."build:vnctl:mac-silicon"]
+description = "Build vnctl for Apple Silicon Macs (arm64)"
+dir = "{{ config_root }}/client/vnctl"
+run = "GOOS=darwin GOARCH=arm64 go build -o ../../build/bin/vnctl-darwin-arm64 main.go"
+
+[tasks."build:vnctl"]
+description = "Build vnctl for ALL target platforms simultaneously"
+depends = [
+    "build:vnctl:linux-amd64",
+    "build:vnctl:windows-amd64",
+    "build:vnctl:mac-intel",
+    "build:vnctl:mac-silicon"
+]
+
+[tasks."build:vnctlsd"]
+description = "Build Python daemon"
+depends = ["setup:python"]
+dir = "{{ config_root }}/server"
+run = '''
+#!/usr/bin/env bash
+set -eu
+
+rm -rf dist
+uv build
+
+ls -lh dist
+'''
+
+[tasks."build"]
+description = "Build everything"
+depends = [
+    "build:vnctl",
+    "build:vnctlsd"
+]
+
+
+# local test install
+
+[tasks."install:local"]
+description = "Install the finished application locally into an isolated path"
+depends = ["build:vnctl-linux-amd64"]
+dir = "{{ config_root }}"
+shell = 'bash -c'
+run = [
+    "test -d {{ config_root }}/.bin || mkdir -p {{ config_root }}/.bin",
+    "cp build/bin/vnctl-linux-amd64 .bin/vnctl",
+    "chmod +x .bin/vnctl",
+    "uv tool install server/ --force",
+]

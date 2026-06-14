@@ -1,0 +1,8 @@
+# local path
+.bin
+# whitelist if ignored elsewhere
+!server
+# local libseccomp
+server/.build
+# python build output
+server/dist

@@ -1,0 +1,43 @@
+name: CI Multi-Platform Build
+
+on:
+  push:
+    branches:
+      - project-restructure
+  pull_request:
+    branches:
+      - project-restructure
+  workflow_dispatch:
+
+jobs:
+  build-all-platforms:
+    name: Cross-Compile All Executables
+    runs-on: ubuntu-latest
+    container:
+        image: fedora:44
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Install Mise & Toolchains
+        uses: jdx/mise-action@v2
+        with:
+          cache: true
+
+      - name: Execute Build Tasks
+        run: mise run build
+
+      - name: Show Build Outputs
+        run: |
+          find build -type f || true
+          find server/dist -type f || true
+
+      - name: Archive Release Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnctlsd-releases
+          path: |
+            build/bin/*
+            server/dist/*.whl
+            server/dist/*.tar.gz
