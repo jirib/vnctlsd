@@ -3,10 +3,10 @@ name: CI Multi-Platform Build
 on:
   push:
     branches:
-      - project-restructure
+      - main
   pull_request:
     branches:
-      - project-restructure
+      - main
   workflow_dispatch:
 
 jobs:
