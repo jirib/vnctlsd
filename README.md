@@ -8,6 +8,12 @@ The daemon drives the terminal server-side. The client is a dumb TLS pipe —
 `socat` works on Linux and macOS, and a minimal Go binary (`vnctl`) is
 provided for Windows compatibility.
 
+> **Status:** `vnctlsd` is young and experimental. The privilege-separation
+> model, configuration format, console backend handling, and operational
+> defaults are still evolving. Treat it as a prototype for lab and development
+> environments, review the security properties for your deployment, and expect
+> incompatible changes before considering it production-ready.
+
 ---
 
 ## Features
@@ -765,10 +771,10 @@ of what the worker sends.
 **Why a format+filter output pipeline?**
 
 Management commands return different output formats (plain strings, JSON,
-multi-line tables). Parsing and normalizing in the monitor means the worker
-never sees raw command output — preventing terminal escape injection — and
-the client always receives clean, consistently formatted text. Adding a new
-command with structured output requires only config changes, no code changes.
+multi-line tables). Parsing, normalizing, and ANSI/VT escape stripping in the
+monitor keeps command output in a consistently rendered terminal form before
+it reaches the client. Adding a new command with structured output requires
+only config changes, no code changes.
 
 ---
 
@@ -799,6 +805,8 @@ command with structured output requires only config changes, no code changes.
 
 ## Limitations
 
+- Young/experimental daemon: configuration schema, console backend behavior,
+  and operational hardening are still evolving.
 - Linux only (landlock, seccomp, inotify, SCM_RIGHTS, TIOCSCTTY)
 - x86_64 only for raw inotify syscall numbers (hardcoded; ARM64 has different
   numbers — trivial to add as a platform-detected constant)
