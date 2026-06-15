@@ -1,5 +1,7 @@
 # vnctlsd
 
+**Virtual/serial coNsole ConTroL Server Daemon** — `vnctlsd`.
+
 A privilege-separated KVM/QEMU serial console dispatcher written in Python,
 inspired by [Conserver](https://www.conserver.com/) but designed for virtual
 machines managed by libvirt.
