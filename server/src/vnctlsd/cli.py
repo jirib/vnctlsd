@@ -97,22 +97,15 @@ def main():
     if os.path.exists(socket_path):
         os.unlink(socket_path)
 
-    server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind(socket_path)
-    server_sock.listen(128)
-
-    socket_mode = int(config.get('core', 'socket_mode', fallback='0660'), 8)
-    socket_group = config.get('core', 'socket_group', fallback='')
-    os.chmod(socket_path, socket_mode)
-    if socket_group:
-        try:
-            import grp as _grp
-            gid = _grp.getgrnam(socket_group).gr_gid
-            os.chown(socket_path, 0, gid)
-            log.info("Socket group: %r (gid=%d)", socket_group, gid)
-        except KeyError:
-            log.warning("Socket group %r not found", socket_group)
+    # The daemon listens on a Unix socket reachable by any local user.
+    # Mode 0o666: world-connectable; identity is established exclusively via
+    # SO_PEERCRED — the kernel-reported uid of the connecting process.
+    trusted_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    trusted_sock.bind(socket_path)
+    trusted_sock.listen(128)
+    os.chmod(socket_path, 0o666)
+    os.chown(socket_path, 0, 0)
+    log.info("Socket: %s", socket_path)
 
     # rpc:   worker ↔ monitor (AUTH, CMD, SPAWN)
     # push:  monitor → worker (SESSION_LIST, ENFORCE)
@@ -143,7 +136,7 @@ def main():
         rpc_m.close(); rpc_w.close()
         push_m.close(); push_w.close()
         watch_worker.close()
-        server_sock.close()
+        trusted_sock.close()
         os.setsid()
 
         run_watcher(ctl_w, watch_w2, console_store, watcher_pw,
@@ -159,7 +152,7 @@ def main():
         watch_w2.close()
         os.setsid()
 
-        run_worker(rpc_w, push_w, watch_worker, server_sock,
+        run_worker(rpc_w, push_w, watch_worker, trusted_sock,
                    config, user_map, console_store, worker_pw,
                    no_seccomp=args.no_seccomp or args.no_privsep,
                    no_landlock=args.no_landlock or args.no_privsep)
@@ -170,7 +163,7 @@ def main():
     ctl_w.close()
     watch_w2.close()
     watch_worker.close()
-    server_sock.close()
+    trusted_sock.close()
 
     if pidfile:
         try:

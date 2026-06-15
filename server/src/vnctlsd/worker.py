@@ -3,14 +3,14 @@ import logging
 import os
 import select
 import socket
+import struct
 import threading
 import time
 import uuid
 
 from .acl import ACLResolver
-from .auth import RateLimiter
 from .config import ConsoleConfigStore, UserMapStore
-from .constants import BANNER, HELP_TEXT, PROMPT
+from .constants import HELP_TEXT, PROMPT
 from .hub import ConsoleHub, HubRegistry
 from .ipc import ipc_send, ipc_recv
 from .process import set_proc_title
@@ -47,15 +47,15 @@ class MonitorProxy:
             raise RuntimeError(f"rpc type mismatch: got {resp.get('type')!r}")
         return resp, fds
 
-    def auth(self, username: str, password: str) -> bool:
+    def lookup_uid(self, uid: int) -> str | None:
+        """Resolve a Unix uid to a username via the monitor (which has /etc access)."""
         try:
             with self._lock:
-                resp, _ = self._call({'type': 'AUTH_REQ',
-                                      'username': username,
-                                      'password': password}, 'AUTH_RESP')
-            return resp.get('ok', False)
+                resp, _ = self._call({'type': 'PEERCRED_LOOKUP_REQ', 'uid': uid},
+                                     'PEERCRED_LOOKUP_RESP')
+            return resp.get('username')
         except RuntimeError:
-            return False
+            return None
 
     def spawn(self, username: str,
               console_name: str) -> tuple[bool, int | None, str]:
@@ -313,87 +313,6 @@ def run_console_session(sock: socket.socket, hub: ConsoleHub,
     hub.remove_client(sid)
 
 
-def authenticate_client_pam(
-        client_sock: socket.socket,
-        monitor: MonitorProxy,
-        user_map: UserMapStore,
-        rate_limiter: RateLimiter,
-        config: configparser.ConfigParser,
-) -> str | None:
-    """
-    Drive the PAM login flow on client_sock.
-
-    Sends the banner, reads username and password, applies rate limiting,
-    verifies credentials via the monitor subprocess, and checks the user map.
-    Returns the authenticated username on success, None on any failure or
-    disconnection.  Sets login_timeout on the socket for the duration.
-
-    Callers do not need to handle TimeoutError — it is caught and causes a
-    None return with "[Login timeout.]" sent to the client.
-    """
-    login_timeout = config.getint('core', 'login_timeout', fallback=30)
-    _MIN_LOGIN_TIME = 2.0
-
-    try:
-        client_sock.settimeout(login_timeout)
-        client_sock.sendall(BANNER)
-
-        client_sock.sendall(b"Username: ")
-        ub = sock_readline(client_sock, echo=True)
-        if not ub:
-            return None
-        username = ub.decode('utf-8', errors='replace').strip()
-        if not username:
-            return None
-
-        client_sock.sendall(b"Password: ")
-        pb = sock_readline(client_sock, echo=False)
-        if pb is None:
-            return None
-        password = pb.decode('utf-8', errors='replace')
-
-        if rate_limiter.is_limited(username):
-            time.sleep(2)
-            client_sock.sendall(b"\r\nLogin failed.\r\n")
-            return None
-
-        # All failure paths produce the same message and take the same
-        # minimum time — an attacker cannot distinguish wrong password,
-        # user not in users.yaml, or no role assigned.
-        _login_start = time.monotonic()
-
-        def _fail(reason: str) -> None:
-            log.warning("Login denied: user=%r reason=%s", username, reason)
-            rate_limiter.record_failure(username)
-            remaining = _MIN_LOGIN_TIME - (time.monotonic() - _login_start)
-            if remaining > 0:
-                time.sleep(remaining)
-            client_sock.sendall(b"\r\nLogin failed.\r\n")
-
-        if not monitor.auth(username, password):
-            _fail("bad_credentials")
-            return None
-
-        if not user_map.user_exists(username):
-            _fail("not_in_usermap")
-            return None
-
-        role = user_map.get_role(username)
-        if role is None:
-            _fail("no_role")
-            return None
-
-        rate_limiter.record_success(username)
-        log.info("Login: user=%r role=%r", username, role)
-        return username
-
-    except TimeoutError:
-        try:
-            client_sock.sendall(b"\r\n[Login timeout.]\r\n")
-        except Exception:
-            pass
-        return None
-
 
 def run_authenticated_session(
         client_sock: socket.socket,
@@ -588,6 +507,78 @@ def run_authenticated_session(
                 f"Unknown command: {action!r}. Type 'help'.\r\n".encode())
 
 
+# Linux struct ucred: pid_t pid (i32), uid_t uid (u32), gid_t gid (u32)
+_UCRED_FMT = 'iII'
+_UCRED_SIZE = struct.calcsize(_UCRED_FMT)
+
+
+def handle_trusted_client(client_sock: socket.socket,
+                           monitor: MonitorProxy,
+                           user_map: UserMapStore,
+                           acl_resolver: ACLResolver,
+                           console_store: ConsoleConfigStore,
+                           registry: SessionRegistry,
+                           hub_registry: HubRegistry,
+                           config: configparser.ConfigParser):
+    """
+    Handle a connection on the trusted Unix socket.
+
+    Identity is derived entirely from SO_PEERCRED — the kernel-reported uid
+    of the connecting process.  The uid → username mapping is delegated to
+    the monitor because /etc/passwd is not accessible after landlock is
+    applied to the worker.
+
+    For the SSH bridge the connecting process IS the authenticated user
+    (sshd drops privileges before exec'ing the subsystem).  For the PAM
+    bridge the connecting process is a per-session child that dropped to the
+    authenticated user's uid after a successful PAM verification.  In both
+    cases the kernel-reported uid is authoritative; no client-supplied claim
+    is trusted.
+    """
+    sid = str(uuid.uuid4())
+    try:
+        try:
+            cred = client_sock.getsockopt(socket.SOL_SOCKET,
+                                          socket.SO_PEERCRED, _UCRED_SIZE)
+            _pid, uid, _gid = struct.unpack(_UCRED_FMT, cred)
+        except OSError as exc:
+            log.warning("SO_PEERCRED failed: %s", exc)
+            try:
+                client_sock.sendall(b"\r\n[Identity error.]\r\n")
+            except Exception:
+                pass
+            return
+
+        username = monitor.lookup_uid(uid)
+        if username is None:
+            log.warning("Trusted connection: cannot resolve uid=%d", uid)
+            try:
+                client_sock.sendall(b"\r\n[Identity error.]\r\n")
+            except Exception:
+                pass
+            return
+
+        if not user_map.user_exists(username):
+            log.warning("Trusted connection: user %r (uid=%d) not in user map",
+                        username, uid)
+            try:
+                client_sock.sendall(b"\r\n[Access denied.]\r\n")
+            except Exception:
+                pass
+            return
+
+        log.info("Trusted login: user=%r uid=%d", username, uid)
+        run_authenticated_session(
+            client_sock, username, sid,
+            monitor, user_map, acl_resolver, console_store,
+            registry, hub_registry, config)
+    except Exception:
+        log.exception("handle_trusted_client error")
+    finally:
+        registry.remove(sid)
+        _close_client_socket(client_sock)
+
+
 def _close_client_socket(sock: socket.socket) -> None:
     try:
         sock.shutdown(socket.SHUT_RDWR)
@@ -599,36 +590,10 @@ def _close_client_socket(sock: socket.socket) -> None:
         pass
 
 
-def handle_client(client_sock: socket.socket,
-                  monitor: MonitorProxy,
-                  user_map: UserMapStore,
-                  acl_resolver: ACLResolver,
-                  console_store: ConsoleConfigStore,
-                  registry: SessionRegistry,
-                  hub_registry: HubRegistry,
-                  rate_limiter: RateLimiter,
-                  config: configparser.ConfigParser):
-    log.debug("handle_client: fd=%d", client_sock.fileno())
-    sid = str(uuid.uuid4())
-    try:
-        username = authenticate_client_pam(
-            client_sock, monitor, user_map, rate_limiter, config)
-        if username is None:
-            return
-        run_authenticated_session(
-            client_sock, username, sid,
-            monitor, user_map, acl_resolver, console_store,
-            registry, hub_registry, config)
-    except Exception:
-        log.exception("handle_client error")
-    finally:
-        registry.remove(sid)
-        _close_client_socket(client_sock)
-
 
 def run_worker(rpc_sock: socket.socket, push_sock: socket.socket,
                watch_sock: socket.socket,
-               server_sock: socket.socket,
+               trusted_sock: socket.socket,
                config: configparser.ConfigParser,
                user_map: UserMapStore,
                console_store: ConsoleConfigStore,
@@ -647,16 +612,12 @@ def run_worker(rpc_sock: socket.socket, push_sock: socket.socket,
 
     socket_path = config.get('core', 'socket_path')
     max_threads = config.getint('core', 'max_threads', fallback=64)
-    max_failures = config.getint('auth', 'max_failures', fallback=5)
-    fail_window = config.getfloat('auth', 'failure_window', fallback=120)
-    lockout_dur = config.getfloat('auth', 'lockout_duration', fallback=60)
     watch_dir = console_store.get_watch_dir()
 
     registry = SessionRegistry()
     hub_registry = HubRegistry()
     acl_resolver = ACLResolver(user_map)
     monitor = MonitorProxy(rpc_sock)
-    rate_limiter = RateLimiter(max_failures, fail_window, lockout_dur)
 
     if no_landlock:
         log.warning("Worker: skipping landlock")
@@ -676,44 +637,38 @@ def run_worker(rpc_sock: socket.socket, push_sock: socket.socket,
         name='push-listener',
     ).start()
 
-    def reaper():
-        while True:
-            time.sleep(60)
-            rate_limiter.reap()
-
-    threading.Thread(target=reaper, daemon=True, name='reaper').start()
-
     semaphore = threading.Semaphore(max_threads)
     log.info("Worker accepting on %s", socket_path)
 
     while True:
         try:
-            client_sock, peer = server_sock.accept()
-            if not semaphore.acquire(blocking=False):
-                log.warning("Thread limit, dropping connection")
-                try:
-                    client_sock.sendall(b"Server at capacity.\r\n")
-                    client_sock.close()
-                except Exception:
-                    pass
-                continue
-
-            def dispatch(sock):
-                try:
-                    handle_client(sock, monitor, user_map, acl_resolver,
-                                  console_store, registry, hub_registry,
-                                  rate_limiter, config)
-                finally:
-                    semaphore.release()
-
-            threading.Thread(
-                target=dispatch, args=(client_sock,),
-                daemon=True, name=f"conn-{peer}",
-            ).start()
-
-        except KeyboardInterrupt:
+            client_sock, peer = trusted_sock.accept()
+        except (KeyboardInterrupt, OSError):
             break
         except Exception:
             log.exception("Accept error")
+            continue
+
+        if not semaphore.acquire(blocking=False):
+            log.warning("Thread limit, dropping connection from %r", peer)
+            try:
+                client_sock.sendall(b"Server at capacity.\r\n")
+                client_sock.close()
+            except Exception:
+                pass
+            continue
+
+        def dispatch(sock):
+            try:
+                handle_trusted_client(
+                    sock, monitor, user_map, acl_resolver,
+                    console_store, registry, hub_registry, config)
+            finally:
+                semaphore.release()
+
+        threading.Thread(
+            target=dispatch, args=(client_sock,),
+            daemon=True, name=f"conn-{peer}",
+        ).start()
 
     log.info("Worker exiting")

@@ -11,7 +11,6 @@ import subprocess
 import time
 
 from .acl import ACLResolver
-from .auth import verify_credentials_subprocess
 from .config import ConsoleConfigStore, UserMapStore
 from .ipc import ipc_send, ipc_recv
 from .output import apply_filter, render_normalized
@@ -132,15 +131,7 @@ def run_monitor(rpc_sock: socket.socket, push_sock: socket.socket,
 
             mtype = msg.get('type')
 
-            if mtype == 'AUTH_REQ':
-                ok = verify_credentials_subprocess(
-                    msg['username'], msg['password'])
-                log.info("AUTH %s: %s", msg['username'],
-                         "ok" if ok else "FAILED")
-                ipc_send(rpc_sock, {'type': 'AUTH_RESP', 'ok': ok,
-                                    'seq': msg.get('seq')})
-
-            elif mtype == 'CMD_REQ':
+            if mtype == 'CMD_REQ':
                 # The worker sends {action, console} — never a raw command.
                 # The monitor validates action against its own config,
                 # builds the command, executes, processes output.
@@ -344,6 +335,18 @@ def run_monitor(rpc_sock: socket.socket, push_sock: socket.socket,
                                             'seq': msg.get('seq')})
                     except Exception:
                         pass
+
+            elif mtype == 'PEERCRED_LOOKUP_REQ':
+                uid = msg.get('uid')
+                username = None
+                try:
+                    if uid is not None:
+                        username = pwd.getpwuid(uid).pw_name
+                except KeyError:
+                    pass
+                ipc_send(rpc_sock, {'type': 'PEERCRED_LOOKUP_RESP',
+                                    'username': username,
+                                    'seq': msg.get('seq')})
 
             elif mtype == 'SESSION_LIST_RESP':
                 sessions = msg.get('sessions', [])

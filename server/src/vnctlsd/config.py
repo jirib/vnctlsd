@@ -268,8 +268,15 @@ class UserMapStore:
         read_write takes priority over read_only if user is in both.
         Returns None if user has no groups or no role defined.
         """
+        return self.get_role_for_groups(self.get_groups(username))
+
+    def get_role_for_groups(self, groups: list[str]) -> str | None:
+        """
+        Resolve an effective role from an explicit group list.
+        Used when groups come from the bridge envelope rather than users.yaml.
+        read_write takes priority over read_only if present in any group.
+        """
         with self._lock:
-            groups = self.get_groups(username)
             group_defs = self._map.get('groups', {})
 
         if not groups:

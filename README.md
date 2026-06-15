@@ -540,7 +540,7 @@ WantedBy=multi-user.target
 ### vnctl (Go binary)
 
 ```bash
-# Connect (server drives login prompt)
+# Connect over TLS (server drives login prompt)
 vnctl -server avocado:8443
 
 # Skip TLS verification (development only)
