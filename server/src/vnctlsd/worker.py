@@ -313,6 +313,292 @@ def run_console_session(sock: socket.socket, hub: ConsoleHub,
     hub.remove_client(sid)
 
 
+def authenticate_client_pam(
+        client_sock: socket.socket,
+        monitor: MonitorProxy,
+        user_map: UserMapStore,
+        rate_limiter: RateLimiter,
+        config: configparser.ConfigParser,
+) -> str | None:
+    """
+    Drive the PAM login flow on client_sock.
+
+    Sends the banner, reads username and password, applies rate limiting,
+    verifies credentials via the monitor subprocess, and checks the user map.
+    Returns the authenticated username on success, None on any failure or
+    disconnection.  Sets login_timeout on the socket for the duration.
+
+    Callers do not need to handle TimeoutError — it is caught and causes a
+    None return with "[Login timeout.]" sent to the client.
+    """
+    login_timeout = config.getint('core', 'login_timeout', fallback=30)
+    _MIN_LOGIN_TIME = 2.0
+
+    try:
+        client_sock.settimeout(login_timeout)
+        client_sock.sendall(BANNER)
+
+        client_sock.sendall(b"Username: ")
+        ub = sock_readline(client_sock, echo=True)
+        if not ub:
+            return None
+        username = ub.decode('utf-8', errors='replace').strip()
+        if not username:
+            return None
+
+        client_sock.sendall(b"Password: ")
+        pb = sock_readline(client_sock, echo=False)
+        if pb is None:
+            return None
+        password = pb.decode('utf-8', errors='replace')
+
+        if rate_limiter.is_limited(username):
+            time.sleep(2)
+            client_sock.sendall(b"\r\nLogin failed.\r\n")
+            return None
+
+        # All failure paths produce the same message and take the same
+        # minimum time — an attacker cannot distinguish wrong password,
+        # user not in users.yaml, or no role assigned.
+        _login_start = time.monotonic()
+
+        def _fail(reason: str) -> None:
+            log.warning("Login denied: user=%r reason=%s", username, reason)
+            rate_limiter.record_failure(username)
+            remaining = _MIN_LOGIN_TIME - (time.monotonic() - _login_start)
+            if remaining > 0:
+                time.sleep(remaining)
+            client_sock.sendall(b"\r\nLogin failed.\r\n")
+
+        if not monitor.auth(username, password):
+            _fail("bad_credentials")
+            return None
+
+        if not user_map.user_exists(username):
+            _fail("not_in_usermap")
+            return None
+
+        role = user_map.get_role(username)
+        if role is None:
+            _fail("no_role")
+            return None
+
+        rate_limiter.record_success(username)
+        log.info("Login: user=%r role=%r", username, role)
+        return username
+
+    except TimeoutError:
+        try:
+            client_sock.sendall(b"\r\n[Login timeout.]\r\n")
+        except Exception:
+            pass
+        return None
+
+
+def run_authenticated_session(
+        client_sock: socket.socket,
+        username: str,
+        sid: str,
+        monitor: MonitorProxy,
+        user_map: UserMapStore,
+        acl_resolver: ACLResolver,
+        console_store: ConsoleConfigStore,
+        registry: SessionRegistry,
+        hub_registry: HubRegistry,
+        config: configparser.ConfigParser,
+) -> None:
+    """
+    Run the command loop for an already-authenticated user.
+
+    Assumes identity has been verified by the caller.  Does not prompt for
+    credentials.  Registers the session, sends "Login successful.", and runs
+    the interactive command loop until the user quits, disconnects, or idles
+    out.  Does not close the socket — that is the caller's responsibility.
+    """
+    idle_timeout = config.getint('core', 'idle_timeout', fallback=300)
+    grace = config.getint('core', 'hub_grace_period', fallback=30)
+
+    registry.add(sid, username, state='prompt', sock=client_sock)
+
+    client_sock.settimeout(idle_timeout)
+    client_sock.sendall(b"\r\nLogin successful.\r\n")
+
+    while True:
+        client_sock.sendall(PROMPT)
+
+        try:
+            line_b = sock_readline(client_sock, echo=True)
+        except TimeoutError:
+            client_sock.sendall(b"\r\n[Idle timeout. Disconnecting.]\r\n")
+            break
+
+        if line_b is None:
+            break
+
+        line = line_b.decode('utf-8', errors='replace').strip()
+        parts = line.split()
+        if not parts:
+            continue
+        action = parts[0].lower()
+
+        if action in ('quit', 'exit'):
+            client_sock.sendall(b"Goodbye.\r\n")
+            break
+
+        elif action == 'help':
+            client_sock.sendall(HELP_TEXT)
+
+        elif action == 'list':
+            cfg = console_store.get()
+            all_consoles: dict[str, tuple[dict, dict]] = {}
+
+            for cname, defn in cfg.get('consoles', {}).items():
+                all_consoles[cname] = (defn, {})
+
+            for hub_snap in hub_registry.snapshot():
+                cname = hub_snap['name']
+                if cname not in all_consoles:
+                    all_consoles[cname] = ({}, {})
+
+            if not all_consoles:
+                client_sock.sendall(b"No consoles defined.\r\n")
+                continue
+
+            lines = []
+            for cname, (defn, vars_) in sorted(all_consoles.items()):
+                level = acl_resolver.resolve_access(
+                    username, cname, defn, vars_)
+                if level is None:
+                    continue
+                hub = hub_registry.get(cname)
+                clients = len(hub.snapshot()['clients']) if hub else 0
+                active = "live" if hub else "idle"
+                lines.append(
+                    f"  {cname:<30} [{active}]  "
+                    f"{clients} client(s)  [{level}]\r\n")
+
+            if not lines:
+                client_sock.sendall(b"No accessible consoles.\r\n")
+            else:
+                client_sock.sendall(''.join(lines).encode())
+
+        elif action == 'console':
+            if len(parts) < 2:
+                client_sock.sendall(b"Usage: console <name>\r\n")
+                continue
+
+            cname = parts[1]
+            cfg = console_store.get()
+
+            defn = cfg.get('consoles', {}).get(cname)
+            vars_: dict = {}
+            if defn is None:
+                # Try reverse-matching console_patterns by console name.
+                match = console_store.match_console_name(cname)
+                if match is not None:
+                    defn, vars_ = match
+
+            if defn is None:
+                hub = hub_registry.get(cname)
+                if hub is None:
+                    # Last resort: use the defaults.console exec fallback.
+                    # This lets any configured VM name be reached without
+                    # an explicit definition or pattern.
+                    defn = console_store.get_default_exec()
+                    if defn is None:
+                        client_sock.sendall(
+                            b"Console not found or not active.\r\n")
+                        continue
+
+            level = acl_resolver.resolve_access(
+                username, cname, defn or {}, vars_)
+            if level is None:
+                client_sock.sendall(b"Access denied to this console.\r\n")
+                continue
+
+            read_only = (level == 'read_only')
+            hub = hub_registry.get(cname)
+
+            if hub is None:
+                if defn is None:
+                    client_sock.sendall(
+                        b"Console not active and no exec definition.\r\n")
+                    continue
+
+                ctype = defn.get('type', 'exec')
+                if ctype != 'exec':
+                    client_sock.sendall(
+                        b"Console not yet active. "
+                        b"Wait for the VM to connect.\r\n")
+                    continue
+
+                # Worker sends only the console name; the monitor resolves
+                # cmd and run_as from its own config.
+                ok, master_fd, err = monitor.spawn(username, cname)
+                if not ok:
+                    client_sock.sendall(f"Spawn failed: {err}\r\n".encode())
+                    continue
+
+                hub, _ = hub_registry.get_or_create(
+                    cname, master_fd, grace=grace)
+
+            mode_str = 'read-only' if read_only else 'read-write'
+            client_sock.sendall(
+                f"\r\n[Attached to {cname} ({mode_str}). "
+                f"Escape: ~. to detach  ~~ for literal ~]\r\n".encode())
+            registry.update(sid, state='console', console=cname,
+                            read_only=read_only)
+
+            client_sock.settimeout(None)
+            run_console_session(client_sock, hub, sid, read_only, registry)
+            hub_registry.remove_if_done(cname)
+
+            client_sock.settimeout(idle_timeout)
+            registry.update(sid, state='prompt', console=None)
+            client_sock.sendall(f"\r\n[Detached from {cname}]\r\n".encode())
+
+        elif action in console_store.get_all_commands():
+            if len(parts) < 2:
+                client_sock.sendall(
+                    f"Usage: {action} <console_name>\r\n".encode())
+                continue
+
+            cname = parts[1]
+            cfg = console_store.get()
+            cmd_defn = cfg.get('consoles', {}).get(cname)
+            cmd_vars: dict = {}
+            if cmd_defn is None:
+                # Check console_patterns so pattern rw/ro lists are
+                # honoured instead of falling back to the user-map role.
+                match = console_store.match_console_name(cname)
+                if match is not None:
+                    cmd_defn, cmd_vars = match
+
+            level = acl_resolver.resolve_access(
+                username, cname, cmd_defn or {}, cmd_vars)
+            if level is None:
+                client_sock.sendall(b"Access denied.\r\n")
+                continue
+
+            rendered = monitor.run_action(action, cname)
+            client_sock.sendall(rendered.encode())
+
+        else:
+            client_sock.sendall(
+                f"Unknown command: {action!r}. Type 'help'.\r\n".encode())
+
+
+def _close_client_socket(sock: socket.socket) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+
 def handle_client(client_sock: socket.socket,
                   monitor: MonitorProxy,
                   user_map: UserMapStore,
@@ -323,250 +609,21 @@ def handle_client(client_sock: socket.socket,
                   rate_limiter: RateLimiter,
                   config: configparser.ConfigParser):
     log.debug("handle_client: fd=%d", client_sock.fileno())
-
-    login_timeout = config.getint('core', 'login_timeout', fallback=30)
-    idle_timeout = config.getint('core', 'idle_timeout', fallback=300)
-    grace = config.getint('core', 'hub_grace_period', fallback=30)
     sid = str(uuid.uuid4())
-
     try:
-        client_sock.settimeout(login_timeout)
-        client_sock.sendall(BANNER)
-
-        client_sock.sendall(b"Username: ")
-        ub = sock_readline(client_sock, echo=True)
-        if not ub:
+        username = authenticate_client_pam(
+            client_sock, monitor, user_map, rate_limiter, config)
+        if username is None:
             return
-        username = ub.decode('utf-8', errors='replace').strip()
-        if not username:
-            return
-
-        client_sock.sendall(b"Password: ")
-        pb = sock_readline(client_sock, echo=False)
-        if pb is None:
-            return
-        password = pb.decode('utf-8', errors='replace')
-
-        if rate_limiter.is_limited(username):
-            time.sleep(2)
-            client_sock.sendall(b"\r\nLogin failed.\r\n")
-            return
-
-        # All failure paths produce the same message and take the same
-        # minimum time — an attacker cannot distinguish wrong password,
-        # user not in users.yaml, or no role assigned.
-        _login_start = time.monotonic()
-        _MIN_LOGIN_TIME = 2.0
-
-        def _fail(reason: str):
-            log.warning("Login denied: user=%r reason=%s", username, reason)
-            rate_limiter.record_failure(username)
-            remaining = _MIN_LOGIN_TIME - (time.monotonic() - _login_start)
-            if remaining > 0:
-                time.sleep(remaining)
-            client_sock.sendall(b"\r\nLogin failed.\r\n")
-
-        if not monitor.auth(username, password):
-            _fail("bad_credentials")
-            return
-
-        if not user_map.user_exists(username):
-            _fail("not_in_usermap")
-            return
-
-        role = user_map.get_role(username)
-        if role is None:
-            _fail("no_role")
-            return
-
-        rate_limiter.record_success(username)
-        log.info("Login: user=%r role=%r", username, role)
-        registry.add(sid, username, state='prompt', sock=client_sock)
-
-        client_sock.settimeout(idle_timeout)
-        client_sock.sendall(b"\r\nLogin successful.\r\n")
-
-        while True:
-            client_sock.sendall(PROMPT)
-
-            try:
-                line_b = sock_readline(client_sock, echo=True)
-            except TimeoutError:
-                client_sock.sendall(b"\r\n[Idle timeout. Disconnecting.]\r\n")
-                break
-
-            if line_b is None:
-                break
-
-            line = line_b.decode('utf-8', errors='replace').strip()
-            parts = line.split()
-            if not parts:
-                continue
-            action = parts[0].lower()
-
-            if action in ('quit', 'exit'):
-                client_sock.sendall(b"Goodbye.\r\n")
-                break
-
-            elif action == 'help':
-                client_sock.sendall(HELP_TEXT)
-
-            elif action == 'list':
-                cfg = console_store.get()
-                all_consoles: dict[str, tuple[dict, dict]] = {}
-
-                for cname, defn in cfg.get('consoles', {}).items():
-                    all_consoles[cname] = (defn, {})
-
-                for hub_snap in hub_registry.snapshot():
-                    cname = hub_snap['name']
-                    if cname not in all_consoles:
-                        all_consoles[cname] = ({}, {})
-
-                if not all_consoles:
-                    client_sock.sendall(b"No consoles defined.\r\n")
-                    continue
-
-                lines = []
-                for cname, (defn, vars_) in sorted(all_consoles.items()):
-                    level = acl_resolver.resolve_access(
-                        username, cname, defn, vars_)
-                    if level is None:
-                        continue
-                    hub = hub_registry.get(cname)
-                    clients = len(hub.snapshot()['clients']) if hub else 0
-                    active = "live" if hub else "idle"
-                    lines.append(
-                        f"  {cname:<30} [{active}]  "
-                        f"{clients} client(s)  [{level}]\r\n")
-
-                if not lines:
-                    client_sock.sendall(b"No accessible consoles.\r\n")
-                else:
-                    client_sock.sendall(''.join(lines).encode())
-
-            elif action == 'console':
-                if len(parts) < 2:
-                    client_sock.sendall(b"Usage: console <name>\r\n")
-                    continue
-
-                cname = parts[1]
-                cfg = console_store.get()
-
-                defn = cfg.get('consoles', {}).get(cname)
-                vars_: dict = {}
-                if defn is None:
-                    # Try reverse-matching console_patterns by console name.
-                    match = console_store.match_console_name(cname)
-                    if match is not None:
-                        defn, vars_ = match
-
-                if defn is None:
-                    hub = hub_registry.get(cname)
-                    if hub is None:
-                        # Last resort: use the defaults.console exec fallback.
-                        # This lets any configured VM name be reached without
-                        # an explicit definition or pattern.
-                        defn = console_store.get_default_exec()
-                        if defn is None:
-                            client_sock.sendall(
-                                b"Console not found or not active.\r\n")
-                            continue
-
-                level = acl_resolver.resolve_access(
-                    username, cname, defn or {}, vars_)
-                if level is None:
-                    client_sock.sendall(b"Access denied to this console.\r\n")
-                    continue
-
-                read_only = (level == 'read_only')
-                hub = hub_registry.get(cname)
-
-                if hub is None:
-                    if defn is None:
-                        client_sock.sendall(
-                            b"Console not active and no exec definition.\r\n")
-                        continue
-
-                    ctype = defn.get('type', 'exec')
-                    if ctype != 'exec':
-                        client_sock.sendall(
-                            b"Console not yet active. "
-                            b"Wait for the VM to connect.\r\n")
-                        continue
-
-                    # Worker sends only the console name; the monitor resolves
-                    # cmd and run_as from its own config.
-                    ok, master_fd, err = monitor.spawn(username, cname)
-                    if not ok:
-                        client_sock.sendall(f"Spawn failed: {err}\r\n".encode())
-                        continue
-
-                    hub, _ = hub_registry.get_or_create(
-                        cname, master_fd, grace=grace)
-
-                mode_str = 'read-only' if read_only else 'read-write'
-                client_sock.sendall(
-                    f"\r\n[Attached to {cname} ({mode_str}). "
-                    f"Escape: ~. to detach  ~~ for literal ~]\r\n".encode())
-                registry.update(sid, state='console', console=cname,
-                                read_only=read_only)
-
-                client_sock.settimeout(None)
-                run_console_session(client_sock, hub, sid, read_only, registry)
-                hub_registry.remove_if_done(cname)
-
-                client_sock.settimeout(idle_timeout)
-                registry.update(sid, state='prompt', console=None)
-                client_sock.sendall(f"\r\n[Detached from {cname}]\r\n".encode())
-
-            elif action in console_store.get_all_commands():
-                if len(parts) < 2:
-                    client_sock.sendall(
-                        f"Usage: {action} <console_name>\r\n".encode())
-                    continue
-
-                cname = parts[1]
-                cfg = console_store.get()
-                cmd_defn = cfg.get('consoles', {}).get(cname)
-                cmd_vars: dict = {}
-                if cmd_defn is None:
-                    # Check console_patterns so pattern rw/ro lists are
-                    # honoured instead of falling back to the user-map role.
-                    match = console_store.match_console_name(cname)
-                    if match is not None:
-                        cmd_defn, cmd_vars = match
-
-                level = acl_resolver.resolve_access(
-                    username, cname, cmd_defn or {}, cmd_vars)
-                if level is None:
-                    client_sock.sendall(b"Access denied.\r\n")
-                    continue
-
-                rendered = monitor.run_action(action, cname)
-                client_sock.sendall(rendered.encode())
-
-            else:
-                client_sock.sendall(
-                    f"Unknown command: {action!r}. Type 'help'.\r\n".encode())
-
-    except TimeoutError:
-        try:
-            client_sock.sendall(b"\r\n[Login timeout.]\r\n")
-        except Exception:
-            pass
+        run_authenticated_session(
+            client_sock, username, sid,
+            monitor, user_map, acl_resolver, console_store,
+            registry, hub_registry, config)
     except Exception:
         log.exception("handle_client error")
     finally:
         registry.remove(sid)
-        try:
-            client_sock.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
-        try:
-            client_sock.close()
-        except Exception:
-            pass
+        _close_client_socket(client_sock)
 
 
 def run_worker(rpc_sock: socket.socket, push_sock: socket.socket,
