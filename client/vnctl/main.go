@@ -4,12 +4,12 @@
 // The client is a dumb pipe — raw terminal mode + bidirectional TLS I/O.
 //
 // Usage:
-//   vnctl -server avocado:8443
-//   vnctl -server avocado:8443 -insecure
-//   vnctl -server avocado:8443 -cert client.crt -key client.key -ca ca.crt
+//   vnctl -server foo.example.com:8443
+//   vnctl -server foo.example.com:8443 -insecure
+//   vnctl -server foo.example.com:8443 -cert client.crt -key client.key -ca ca.crt
 //
 // On Linux/macOS the equivalent without this binary:
-//   socat $(tty),raw,echo=0 OPENSSL:avocado:8443,verify=0
+//   socat $(tty),raw,echo=0 OPENSSL:foo.example.com:8443,verify=0
 //
 // This binary exists primarily for Windows compatibility, where socat is
 // not available and raw terminal mode requires the Windows Console API
@@ -29,11 +29,11 @@ import (
 )
 
 func main() {
-	server  := flag.String("server",   "localhost:8443", "vnctlsd server address (host:port)")
-	insecure := flag.Bool("insecure",  false,            "skip TLS certificate verification")
-	certFile := flag.String("cert",    "",               "client certificate file (PEM)")
-	keyFile  := flag.String("key",     "",               "client key file (PEM)")
-	caFile   := flag.String("ca",      "",               "CA certificate file (PEM) for server verification")
+	server := flag.String("server", "localhost:8443", "vnctlsd server address (host:port)")
+	insecure := flag.Bool("insecure", false, "skip TLS certificate verification")
+	certFile := flag.String("cert", "", "client certificate file (PEM)")
+	keyFile := flag.String("key", "", "client key file (PEM)")
+	caFile := flag.String("ca", "", "CA certificate file (PEM) for server verification")
 	flag.Parse()
 
 	// -- TLS config ----------------------------------------------------------

@@ -8,6 +8,23 @@ from .glob_patterns import compile_glob_pattern, match_glob_pattern
 log = logging.getLogger(__name__)
 
 
+def _precompile_patterns(data: dict) -> dict:
+    """
+    Compile glob patterns and name templates inside console_patterns in-place.
+    Keys starting with '_' are private and must be stripped before JSON
+    serialisation — see ConsoleConfigStore.get_raw().
+    """
+    for pat in data.get('console_patterns', []):
+        if 'socket_glob' in pat:
+            fnmatch_pat, regex = compile_glob_pattern(pat['socket_glob'])
+            pat['_fnmatch'] = fnmatch_pat
+            pat['_regex'] = regex
+        if 'console_name' in pat:
+            _, name_regex = compile_glob_pattern(pat['console_name'])
+            pat['_name_regex'] = name_regex
+    return data
+
+
 def load_console_config(path: str) -> dict:
     """
     Load consoles.yaml / consoles.toml.
@@ -36,13 +53,7 @@ def load_console_config(path: str) -> dict:
     else:
         raise ValueError(f"Unsupported format: {ext}")
 
-    for pat in data.get('console_patterns', []):
-        if 'socket_glob' in pat:
-            fnmatch_pat, regex = compile_glob_pattern(pat['socket_glob'])
-            pat['_fnmatch'] = fnmatch_pat
-            pat['_regex'] = regex
-
-    return data
+    return _precompile_patterns(data)
 
 
 class ConsoleConfigStore:
@@ -61,6 +72,34 @@ class ConsoleConfigStore:
         with self._lock:
             self._cfg = new_cfg
         return new_cfg
+
+    def get_raw(self) -> dict:
+        """
+        Return the config suitable for JSON serialisation.
+        Private '_*' keys (compiled regexes, fnmatch strings) are stripped;
+        the receiver must call update() to re-compile them.
+        """
+        def _strip(obj):
+            if isinstance(obj, dict):
+                return {k: _strip(v) for k, v in obj.items()
+                        if not k.startswith('_')}
+            if isinstance(obj, list):
+                return [_strip(el) for el in obj]
+            return obj
+
+        with self._lock:
+            return _strip(self._cfg)
+
+    def update(self, raw_dict: dict):
+        """
+        Replace the in-memory config from a raw (JSON-deserialised) dict,
+        re-compiling glob patterns.  Used by worker/watcher after receiving
+        a CONFIG_UPDATE push from the monitor.
+        """
+        import copy
+        processed = _precompile_patterns(copy.deepcopy(raw_dict))
+        with self._lock:
+            self._cfg = processed
 
     def match_socket(self, socket_path: str) -> tuple[dict, dict] | None:
         """
@@ -133,6 +172,22 @@ class ConsoleConfigStore:
                     .get('socket_validation', {})
                     .get('watch_dir', '/run/vnctlsd/'))
 
+    def match_console_name(self, cname: str) -> tuple[dict, dict] | None:
+        """
+        Find a console_pattern whose console_name template matches cname.
+        Returns (definition, template_vars) or None.
+        """
+        with self._lock:
+            cfg = self._cfg
+        for pat in cfg.get('console_patterns', []):
+            name_regex = pat.get('_name_regex')
+            if name_regex is None:
+                continue
+            m = name_regex.match(cname)
+            if m:
+                return dict(pat), m.groupdict()
+        return None
+
 
 def load_user_map(path: str) -> dict:
     """
@@ -181,6 +236,11 @@ class UserMapStore:
         with self._lock:
             self._map = new_map
         return new_map
+
+    def update(self, data: dict):
+        """Replace the in-memory map with freshly pushed data from the monitor."""
+        with self._lock:
+            self._map = data
 
     def get_groups(self, username: str) -> list[str]:
         with self._lock:

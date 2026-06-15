@@ -4,6 +4,13 @@ import re
 
 log = logging.getLogger(__name__)
 
+# Matches ANSI/VT escape sequences (CSI sequences and lone ESC codes).
+_ANSI_ESCAPE = re.compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE.sub('', text)
+
 
 def _parse_output(raw: str, fmt: str) -> object:
     """Parse raw command output according to declared format."""
@@ -101,27 +108,33 @@ def apply_filter(raw: str, fmt: str, filter_def: dict | None) -> dict:
 
 
 def render_normalized(result: dict) -> str:
-    """Render a normalized structure to a terminal-ready string (\\r\\n endings)."""
+    """Render a normalized structure to a terminal-ready string (\\r\\n endings).
+
+    ANSI escape sequences are stripped from all values to prevent terminal
+    escape injection from command output reaching the client.
+    """
     t = result.get('type', 'string')
 
     if t == 'string':
-        return result.get('value', '').rstrip() + '\r\n'
+        return _strip_ansi(result.get('value', '')).rstrip() + '\r\n'
 
     elif t == 'list':
         items = result.get('items', [])
         if not items:
             return '(empty)\r\n'
-        return ''.join(f"  {item}\r\n" for item in items)
+        return ''.join(f"  {_strip_ansi(item)}\r\n" for item in items)
 
     elif t == 'table':
         rows = result.get('rows', [])
         if not rows:
             return '(empty)\r\n'
         width = max(len(k) for k, _ in rows)
-        return ''.join(f"  {k:<{width}}  {v}\r\n" for k, v in rows)
+        return ''.join(
+            f"  {_strip_ansi(k):<{width}}  {_strip_ansi(v)}\r\n"
+            for k, v in rows)
 
     elif t == 'status':
         prefix = '✓' if result.get('ok') else '✗'
-        return f"{prefix} {result.get('message', '')}\r\n"
+        return f"{prefix} {_strip_ansi(result.get('message', ''))}\r\n"
 
-    return str(result) + '\r\n'
+    return _strip_ansi(str(result)) + '\r\n'

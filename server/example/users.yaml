@@ -1,7 +1,7 @@
 users:
   student01:
     groups: [lab-a]
-  jbelka:
+  foobar:
     groups: [mentors]
 
 groups:

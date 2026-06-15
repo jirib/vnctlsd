@@ -32,8 +32,9 @@ provided for Windows compatibility.
   drop and after all library resolution.
 - **Two console delivery modes**:
   - `exec` — daemon spawns `virsh console <vm>` on demand when a user attaches
-  - `qemu_unix` — QEMU dials the daemon at VM boot over a unix socket;
-    the hub is live from the first byte, capturing early boot output before
+  - `qemu_unix` — QEMU creates a unix socket at VM boot (libvirt
+    `<source mode='bind'/>`); the daemon's watcher detects it and connects.
+    The hub is live from the first byte, capturing early boot output before
     any user attaches
 - **Glob-based console patterns** — one pattern covers many VMs:
   `/run/vnctlsd/console-{name}.sock` matches all QEMU sockets and extracts
@@ -47,7 +48,8 @@ provided for Windows compatibility.
 - **Output processing pipeline** — each command declares its output format
   (`raw`, `json`, `lines`) and an optional filter that normalizes the output
   into one of four structured types (`string`, `list`, `table`, `status`)
-  before rendering to the terminal. Raw command output never reaches the client.
+  before rendering to the terminal. ANSI/VT escape sequences are stripped from
+  all rendered values before they reach the client.
 - **Two-axis ACL** — console definitions carry `rw`/`ro` lists (usernames,
   group names, or `*`). Users carry group memberships with roles. Console ACL
   takes priority; user map role is the fallback. Template variables from glob
@@ -358,7 +360,7 @@ consoles:
 # Pattern-based definitions (matched when no explicit definition applies)
 # {name} is extracted from the socket filename via glob capture
 console_patterns:
-  # QEMU dials in at VM boot — hub live before any user attaches
+  # QEMU creates the socket at VM boot; daemon connects — hub live before any user attaches
   - socket_glob: /run/vnctlsd/console-{name}.sock
     type: qemu_unix
     console_name: "{name}"
@@ -406,20 +408,21 @@ connect to an untrusted socket.
 
 ## QEMU console socket setup
 
-Configure each VM to connect to a per-VM unix socket at boot:
+Configure each VM to bind a per-VM unix socket at boot. QEMU creates and
+owns the socket; the daemon's watcher detects it and connects:
 
 ```xml
 <!-- In the libvirt domain XML, add inside <devices>: -->
 <serial type='unix'>
-  <source mode='connect' path='/run/vnctlsd/console-vm-lab01.sock'/>
+  <source mode='bind' path='/run/vnctlsd/console-vm-lab01.sock'/>
   <protocol type='raw'/>
   <target type='isa-serial' port='0'/>
 </serial>
 ```
 
-The daemon listens on the socket; QEMU connects when the VM starts. The
-hub is live from the first BIOS byte, capturing all output before any user
-attaches.
+QEMU creates the socket file at VM boot and listens on it. The daemon
+connects when the socket appears in the watch directory. The hub is live
+from the first BIOS byte, capturing all output before any user attaches.
 
 ---
 
@@ -638,14 +641,18 @@ A compromised worker cannot cause the monitor to run arbitrary commands as root.
 
 ### Output processing pipeline
 
-Raw command output never reaches the client. The monitor:
+The monitor passes command output through a format+filter pipeline before
+sending it to the worker. The worker sends only the pre-rendered string to
+the client. The pipeline steps:
+
 1. Executes the command
 2. Parses output according to the declared `format` (`raw`/`json`/`lines`)
 3. Applies the `filter` to produce a normalized structure
-4. Renders the structure to a terminal string
-5. Sends only the rendered string back to the worker
+4. Strips ANSI/VT escape sequences from all string values
+5. Renders the structure to a terminal string
+6. Sends only the rendered string back to the worker
 
-This prevents terminal escape injection from malicious command output and
+This sanitises terminal escape sequences from command output and
 decouples the client display from command output formats.
 
 ### Socket validation (watcher + worker)
@@ -785,23 +792,3 @@ command with structured output requires only config changes, no code changes.
   abstraction is in place; `FileACLResolver` is the only current backend)
 - `qemu_unix` console patterns require QEMU to be configured to use unix
   socket serial output (libvirt domain XML change per VM)
-
----
-
-## License
-
-ISC License — the same license used by OpenBSD.
-
-Copyright (c) 2026 jbelka
-
-Permission to use, copy, modify, and distribute this software for any
-purpose with or without fee is hereby granted, provided that the above
-copyright notice and this permission notice appear in all copies.
-
-THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
-ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.

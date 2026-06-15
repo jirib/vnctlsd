@@ -37,6 +37,7 @@ def run_watcher(ctl_sock: socket.socket, watch_sock: socket.socket,
     log.info("Watcher started (pid=%d), dropping to %r",
              os.getpid(), watcher_pw.pw_name)
 
+    os.setgroups([])
     os.setgid(watcher_pw.pw_gid)
     os.setuid(watcher_pw.pw_uid)
 
@@ -184,6 +185,10 @@ def run_watcher(ctl_sock: socket.socket, watch_sock: socket.socket,
                 break
 
             if msg.get('type') == 'RELOAD_WATCH':
+                raw_cfg = msg.get('console_config')
+                if raw_cfg:
+                    console_store.update(raw_cfg)
+                    log.info("Watcher: console config updated from monitor")
                 new_dir = msg.get('watch_dir', watch_dir)
                 log.info("Watcher: RELOAD_WATCH → %r", new_dir)
                 start_watch(new_dir)

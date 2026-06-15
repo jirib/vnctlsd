@@ -10,6 +10,7 @@ import socket
 import subprocess
 import time
 
+from .acl import ACLResolver
 from .auth import verify_credentials_subprocess
 from .config import ConsoleConfigStore, UserMapStore
 from .ipc import ipc_send, ipc_recv
@@ -47,10 +48,23 @@ def run_monitor(rpc_sock: socket.socket, push_sock: socket.socket,
             log.info("Console config reloaded from %s", consoles_path)
         except Exception as exc:
             log.error("Console config reload failed: %s", exc)
+        raw_cfg = console_store.get_raw()
+        # Push refreshed console config to worker so its local copy stays
+        # in sync (ACLs, patterns, commands, socket validation rules).
+        try:
+            ipc_send(push_sock, {
+                'type': 'CONFIG_UPDATE',
+                'console_config': raw_cfg,
+            })
+        except Exception as exc:
+            log.error("CONFIG_UPDATE send failed: %s", exc)
+        # Push refreshed watch_dir + console config to watcher so its
+        # pattern matching and trusted_uid resolution stay current.
         try:
             ipc_send(ctl_sock, {
                 'type': 'RELOAD_WATCH',
                 'watch_dir': console_store.get_watch_dir(),
+                'console_config': raw_cfg,
             })
         except Exception as exc:
             log.error("RELOAD_WATCH send failed: %s", exc)
@@ -195,10 +209,88 @@ def run_monitor(rpc_sock: socket.socket, push_sock: socket.socket,
                                     'seq': msg.get('seq')})
 
             elif mtype == 'SPAWN_REQ':
-                username = msg['username']
-                console_name = msg['console']
-                cmd_template = msg['cmd']
-                run_as_name = msg['run_as']
+                # The worker sends only {username, console} — never a raw cmd
+                # or run_as.  The monitor validates against its own refreshed
+                # config so a compromised worker cannot cause arbitrary exec.
+                username = msg.get('username', '')
+                console_name = msg.get('console', '')
+
+                if not validate_vm_name(console_name):
+                    log.warning("SPAWN_REQ: invalid console name %r",
+                                console_name)
+                    ipc_send(rpc_sock, {'type': 'SPAWN_RESP', 'ok': False,
+                                        'error': 'invalid console name',
+                                        'seq': msg.get('seq')})
+                    continue
+
+                # Look up definition from monitor's own config.
+                cfg = console_store.get()
+                defn = cfg.get('consoles', {}).get(console_name)
+                vars_: dict = {}
+                if defn is None:
+                    match = console_store.match_console_name(console_name)
+                    if match:
+                        defn, vars_ = match
+
+                if defn is None:
+                    log.warning("SPAWN_REQ: console %r not in config",
+                                console_name)
+                    ipc_send(rpc_sock, {'type': 'SPAWN_RESP', 'ok': False,
+                                        'error': (f"console {console_name!r} "
+                                                  f"not defined"),
+                                        'seq': msg.get('seq')})
+                    continue
+
+                if defn.get('type', 'exec') != 'exec':
+                    log.warning("SPAWN_REQ: console %r is not exec type",
+                                console_name)
+                    ipc_send(rpc_sock, {'type': 'SPAWN_RESP', 'ok': False,
+                                        'error': (f"console {console_name!r} "
+                                                  f"is not exec type"),
+                                        'seq': msg.get('seq')})
+                    continue
+
+                # Re-verify ACL using the monitor's own current config so a
+                # compromised worker cannot spawn consoles on behalf of users
+                # who don't have access.
+                acl = ACLResolver(user_map_store)
+                if acl.resolve_access(username, console_name,
+                                      defn, vars_) is None:
+                    log.warning(
+                        "SPAWN_REQ: user %r denied access to %r "
+                        "(monitor ACL re-check)",
+                        username, console_name)
+                    ipc_send(rpc_sock, {'type': 'SPAWN_RESP', 'ok': False,
+                                        'error': 'access denied',
+                                        'seq': msg.get('seq')})
+                    continue
+
+                cmd_template = defn.get('cmd', '')
+                if not cmd_template:
+                    log.warning("SPAWN_REQ: console %r has no cmd",
+                                console_name)
+                    ipc_send(rpc_sock, {'type': 'SPAWN_RESP', 'ok': False,
+                                        'error': (f"console {console_name!r} "
+                                                  f"has no cmd"),
+                                        'seq': msg.get('seq')})
+                    continue
+
+                try:
+                    cmd_str = cmd_template.format(name=console_name, **vars_)
+                except KeyError as e:
+                    log.error("SPAWN_REQ: cmd template error for %r: %s",
+                              console_name, e)
+                    ipc_send(rpc_sock, {'type': 'SPAWN_RESP', 'ok': False,
+                                        'error': f"cmd template error: {e}",
+                                        'seq': msg.get('seq')})
+                    continue
+
+                run_as_name = defn.get(
+                    'run_as',
+                    config.get('spawn', 'run_as', fallback='_vnctlsd')
+                    if config.has_option('spawn', 'run_as')
+                    else '_vnctlsd',
+                )
 
                 try:
                     pw = pwd.getpwnam(run_as_name)
@@ -210,7 +302,7 @@ def run_monitor(rpc_sock: socket.socket, push_sock: socket.socket,
                     continue
 
                 import pty as _pty
-                cmd = shlex.split(cmd_template)
+                cmd = shlex.split(cmd_str)
                 try:
                     master_fd, slave_fd = _pty.openpty()
                     child = os.fork()
@@ -218,6 +310,7 @@ def run_monitor(rpc_sock: socket.socket, push_sock: socket.socket,
                         try:
                             import fcntl as _fcntl
                             os.close(master_fd)
+                            os.setgroups([])
                             os.setgid(pw.pw_gid)
                             os.setuid(pw.pw_uid)
                             os.setsid()
@@ -232,7 +325,7 @@ def run_monitor(rpc_sock: socket.socket, push_sock: socket.socket,
 
                     os.close(slave_fd)
                     log.info("Spawned: console=%r cmd=%r pid=%d user=%r",
-                             console_name, cmd_template, child, run_as_name)
+                             console_name, cmd_str, child, run_as_name)
                     ipc_send(rpc_sock, {'type': 'SPAWN_RESP', 'ok': True,
                                         'pid': child,
                                         'seq': msg.get('seq')},

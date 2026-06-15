@@ -57,16 +57,19 @@ class MonitorProxy:
         except RuntimeError:
             return False
 
-    def spawn(self, username: str, console_name: str,
-              cmd: str, run_as: str) -> tuple[bool, int | None, str]:
+    def spawn(self, username: str,
+              console_name: str) -> tuple[bool, int | None, str]:
+        """
+        Ask the monitor to spawn an exec console.  The monitor resolves cmd
+        and run_as from its own config — the worker never passes a command
+        string so a compromised worker cannot cause arbitrary exec as root.
+        """
         try:
             with self._lock:
                 resp, fds = self._call({
                     'type': 'SPAWN_REQ',
                     'username': username,
                     'console': console_name,
-                    'cmd': cmd,
-                    'run_as': run_as,
                 }, 'SPAWN_RESP')
             if resp.get('ok') and fds:
                 return True, fds[0], ''
@@ -112,6 +115,7 @@ def monitor_push_listener(push_sock: socket.socket,
                            hub_registry: HubRegistry,
                            acl_resolver: ACLResolver,
                            console_store: ConsoleConfigStore,
+                           user_map: UserMapStore,
                            monitor: MonitorProxy,
                            config: configparser.ConfigParser):
     """
@@ -147,7 +151,18 @@ def monitor_push_listener(push_sock: socket.socket,
                     'hubs': hub_registry.snapshot(),
                 })
 
+            elif mtype == 'CONFIG_UPDATE':
+                raw = msg.get('console_config')
+                if raw:
+                    console_store.update(raw)
+                    log.info("Push listener: console config updated from monitor")
+
             elif mtype == 'ENFORCE_REQ':
+                # Apply the refreshed user map the monitor just pushed so
+                # ACL enforcement uses current data, not the post-fork copy.
+                fresh_map = msg.get('user_map')
+                if fresh_map:
+                    user_map.update(fresh_map)
                 killed, retained = registry.kill_stale(
                     acl_resolver, console_store)
                 ipc_send(push_sock, {
@@ -207,7 +222,7 @@ def monitor_push_listener(push_sock: socket.socket,
                             "Worker: socket %r disappeared, "
                             "tearing down hub %r immediately",
                             path, name)
-                        hub._done.set()
+                        hub.shutdown()
                         hub_registry.remove_if_done(name)
 
             else:
@@ -439,17 +454,22 @@ def handle_client(client_sock: socket.socket,
                 cfg = console_store.get()
 
                 defn = cfg.get('consoles', {}).get(cname)
-                vars_ = {}
+                vars_: dict = {}
                 if defn is None:
-                    for pat in cfg.get('console_patterns', []):
-                        pass  # name-only reverse lookup is imperfect; rely on hub
+                    # Try reverse-matching console_patterns by console name.
+                    match = console_store.match_console_name(cname)
+                    if match is not None:
+                        defn, vars_ = match
 
+                if defn is None:
+                    # No static definition — check for a live hub
+                    # (e.g. a qemu_unix console whose pattern was matched
+                    # when the socket appeared but has no name-based defn).
                     hub = hub_registry.get(cname)
                     if hub is None:
                         client_sock.sendall(
                             b"Console not found or not active.\r\n")
                         continue
-                    defn = {}
 
                 level = acl_resolver.resolve_access(
                     username, cname, defn or {}, vars_)
@@ -473,22 +493,9 @@ def handle_client(client_sock: socket.socket,
                             b"Wait for the VM to connect.\r\n")
                         continue
 
-                    cmd_template = defn.get('cmd', '')
-                    try:
-                        cmd_str = cmd_template.format(name=cname, **vars_)
-                    except KeyError as e:
-                        client_sock.sendall(
-                            f"Console cmd template error: {e}\r\n".encode())
-                        continue
-
-                    run_as = defn.get('run_as',
-                                      config.get('spawn', 'run_as',
-                                                 fallback='_vnctlsd')
-                                      if config.has_option('spawn', 'run_as')
-                                      else '_vnctlsd')
-
-                    ok, master_fd, err = monitor.spawn(
-                        username, cname, cmd_str, run_as)
+                    # Worker sends only the console name; the monitor resolves
+                    # cmd and run_as from its own config.
+                    ok, master_fd, err = monitor.spawn(username, cname)
                     if not ok:
                         client_sock.sendall(f"Spawn failed: {err}\r\n".encode())
                         continue
@@ -519,10 +526,17 @@ def handle_client(client_sock: socket.socket,
 
                 cname = parts[1]
                 cfg = console_store.get()
-                defn = cfg.get('consoles', {}).get(cname, {})
+                cmd_defn = cfg.get('consoles', {}).get(cname)
+                cmd_vars: dict = {}
+                if cmd_defn is None:
+                    # Check console_patterns so pattern rw/ro lists are
+                    # honoured instead of falling back to the user-map role.
+                    match = console_store.match_console_name(cname)
+                    if match is not None:
+                        cmd_defn, cmd_vars = match
 
                 level = acl_resolver.resolve_access(
-                    username, cname, defn, {})
+                    username, cname, cmd_defn or {}, cmd_vars)
                 if level is None:
                     client_sock.sendall(b"Access denied.\r\n")
                     continue
@@ -568,6 +582,7 @@ def run_worker(rpc_sock: socket.socket, push_sock: socket.socket,
     log.info("Worker started (pid=%d), dropping to %r",
              os.getpid(), worker_pw.pw_name)
 
+    os.setgroups([])
     os.setgid(worker_pw.pw_gid)
     os.setuid(worker_pw.pw_uid)
 
@@ -597,7 +612,7 @@ def run_worker(rpc_sock: socket.socket, push_sock: socket.socket,
     threading.Thread(
         target=monitor_push_listener,
         args=(push_sock, watch_sock, registry, hub_registry,
-              acl_resolver, console_store, monitor, config),
+              acl_resolver, console_store, user_map, monitor, config),
         daemon=True,
         name='push-listener',
     ).start()

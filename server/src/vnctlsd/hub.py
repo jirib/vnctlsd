@@ -53,13 +53,21 @@ class ConsoleHub:
             self._grace_timer = t
         log.info("Hub[%s]: grace period armed (%ds)", self.name, self._grace)
 
+    def shutdown(self):
+        """Signal done and close the console fd to unblock the reader thread."""
+        self._done.set()
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
     def _teardown(self):
         with self._lock:
             if self._clients:
                 return
             self._grace_timer = None
         log.info("Hub[%s]: grace expired, tearing down", self.name)
-        self._done.set()
+        self.shutdown()
 
     def write_input(self, data: bytes):
         try:
@@ -156,5 +164,5 @@ class HubRegistry:
     def teardown_all(self):
         with self._lock:
             for hub in self._hubs.values():
-                hub._done.set()
+                hub.shutdown()
             self._hubs.clear()
