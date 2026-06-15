@@ -1,7 +1,46 @@
-socket_validation:           # global defaults
+socket_validation:           # global defaults for QEMU socket ownership checks
   trusted_uid: libvirt-qemu
   watch_dir: /run/vnctlsd/
 
+# ---------------------------------------------------------------------------
+# Default console backend
+#
+# When a user types 'console <name>' and no explicit console or pattern
+# matches, the daemon falls back to this exec definition.  {name} is
+# substituted with the console name typed by the user.
+#
+# Remove or comment out this section if you want unknown names to be
+# rejected rather than forwarded to virsh.
+# ---------------------------------------------------------------------------
+defaults:
+  console:
+    type: exec
+    cmd: "virsh -c qemu:///system console {name} --force"
+    run_as: _vnctlsd
+
+# ---------------------------------------------------------------------------
+# Management commands
+#
+# Config-driven, validated by the monitor before execution.
+# {name} is substituted with the console name (validated against VM_NAME_RE).
+#
+# format: raw | json | lines
+#   raw   — output forwarded as a plain string
+#   json  — output parsed as JSON (dict or list)
+#   lines — output split on newlines, empty lines dropped
+#
+# filter.type: string | list | table | status
+#   string — render as a single line
+#     value: "{output}"         template over parsed output
+#   list   — render as an indented bullet list
+#     items: "[].fieldname"     extract a field from each JSON array element
+#   table  — render as a key-value table
+#     rows:
+#       - [Label, "{field}"]    each row: label + template over JSON object
+#   status — render as ✓/✗ with message
+#     ok_if: "regex"            regex matched against raw output → ok=true
+#     message: "{output}"       message template
+# ---------------------------------------------------------------------------
 commands:
   status:
     cmd: "virsh -c qemu:///system domstate {name}"
@@ -42,27 +81,35 @@ commands:
       type: list
       items: "[].name"
 
-consoles:                    # explicit definitions (highest priority)
+# ---------------------------------------------------------------------------
+# Explicit console definitions   (highest priority — checked first)
+#
+# Use for VMs that need per-console ACL overrides or non-default settings.
+# ---------------------------------------------------------------------------
+consoles:
   vm-special:
     type: qemu_unix
     socket: /run/vnctlsd/console-vm-special.sock
     validation:
-      trusted_uid: root      # override for this console
+      trusted_uid: root      # override: this socket is owned by root
     rw: [admin]
-    ro: []
+    ro: [mentors]
 
-console_patterns:            # glob-based (matched when no explicit def)
+# ---------------------------------------------------------------------------
+# Pattern-based definitions  (matched by socket filename when no explicit
+# definition applies)
+#
+# Only use socket_glob for socket-backed transports (qemu_unix).
+# exec consoles are covered by the defaults.console fallback above.
+# ---------------------------------------------------------------------------
+console_patterns:
+  # QEMU creates the socket at VM boot (libvirt mode="bind"); the daemon
+  # connects when the socket appears.  The hub is live before any user
+  # attaches, capturing early boot output (BIOS, GRUB, kernel).
   - socket_glob: /run/vnctlsd/console-{name}.sock
     type: qemu_unix
     console_name: "{name}"
     validation:
       trusted_uid: libvirt-qemu
-    rw: ["{name}"]
-    ro: [mentors]
-
-  - socket_glob: /run/vnctlsd/exec-{name}.sock
-    type: exec
-    console_name: "{name}"
-    cmd: "virsh -c qemu:///system console {name} --force"
-    rw: ["{name}"]
-    ro: [mentors]
+    rw: ["{name}"]       # username matching VM name → read-write
+    ro: [mentors]        # mentors group → read-only on all VMs

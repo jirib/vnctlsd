@@ -434,11 +434,11 @@ def handle_client(client_sock: socket.socket,
                     if level is None:
                         continue
                     hub = hub_registry.get(cname)
-                    watchers = len(hub.snapshot()['clients']) if hub else 0
+                    clients = len(hub.snapshot()['clients']) if hub else 0
                     active = "live" if hub else "idle"
                     lines.append(
                         f"  {cname:<30} [{active}]  "
-                        f"{watchers} watcher(s)  [{level}]\r\n")
+                        f"{clients} client(s)  [{level}]\r\n")
 
                 if not lines:
                     client_sock.sendall(b"No accessible consoles.\r\n")
@@ -462,14 +462,16 @@ def handle_client(client_sock: socket.socket,
                         defn, vars_ = match
 
                 if defn is None:
-                    # No static definition — check for a live hub
-                    # (e.g. a qemu_unix console whose pattern was matched
-                    # when the socket appeared but has no name-based defn).
                     hub = hub_registry.get(cname)
                     if hub is None:
-                        client_sock.sendall(
-                            b"Console not found or not active.\r\n")
-                        continue
+                        # Last resort: use the defaults.console exec fallback.
+                        # This lets any configured VM name be reached without
+                        # an explicit definition or pattern.
+                        defn = console_store.get_default_exec()
+                        if defn is None:
+                            client_sock.sendall(
+                                b"Console not found or not active.\r\n")
+                            continue
 
                 level = acl_resolver.resolve_access(
                     username, cname, defn or {}, vars_)

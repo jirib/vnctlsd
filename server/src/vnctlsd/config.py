@@ -172,6 +172,19 @@ class ConsoleConfigStore:
                     .get('socket_validation', {})
                     .get('watch_dir', '/run/vnctlsd/'))
 
+    def get_default_exec(self) -> dict | None:
+        """
+        Return the defaults.console dict when it defines an exec backend.
+        Used as a last-resort fallback when a console name matches neither an
+        explicit definition nor any console_pattern.  Returns None when no
+        defaults.console is configured or when it is not of type exec.
+        """
+        with self._lock:
+            defn = self._cfg.get('defaults', {}).get('console')
+        if defn and defn.get('type', 'exec') == 'exec':
+            return dict(defn)
+        return None
+
     def match_console_name(self, cname: str) -> tuple[dict, dict] | None:
         """
         Find a console_pattern whose console_name template matches cname.

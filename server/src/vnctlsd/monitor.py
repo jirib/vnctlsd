@@ -233,6 +233,10 @@ def run_monitor(rpc_sock: socket.socket, push_sock: socket.socket,
                         defn, vars_ = match
 
                 if defn is None:
+                    # Fall back to defaults.console exec backend.
+                    defn = console_store.get_default_exec()
+
+                if defn is None:
                     log.warning("SPAWN_REQ: console %r not in config",
                                 console_name)
                     ipc_send(rpc_sock, {'type': 'SPAWN_RESP', 'ok': False,

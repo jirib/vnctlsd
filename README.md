@@ -31,11 +31,13 @@ provided for Windows compatibility.
   filesystem paths and syscalls it actually needs, applied after privilege
   drop and after all library resolution.
 - **Two console delivery modes**:
-  - `exec` — daemon spawns `virsh console <vm>` on demand when a user attaches
+  - `exec` — daemon spawns a command (e.g. `virsh console <vm>`) on demand
+    when a user attaches. A `defaults.console` backend applies as a fallback
+    for any VM name that has no explicit definition or socket pattern.
   - `qemu_unix` — QEMU creates a unix socket at VM boot (libvirt
     `<source mode='bind'/>`); the daemon's watcher detects it and connects.
     The hub is live from the first byte, capturing early boot output before
-    any user attaches
+    any user attaches. `socket_glob` patterns are only for this mode.
 - **Glob-based console patterns** — one pattern covers many VMs:
   `/run/vnctlsd/console-{name}.sock` matches all QEMU sockets and extracts
   the VM name automatically. Template variables are substituted into ACL
@@ -277,6 +279,19 @@ socket_validation:
   trusted_uid: libvirt-qemu   # QEMU sockets must be owned by this user
   watch_dir: /run/vnctlsd/    # directory watched for QEMU unix sockets
 
+# ---------------------------------------------------------------------------
+# Default console backend
+#
+# Used when 'console <name>' is typed and no explicit definition or pattern
+# matches the name.  {name} is substituted with the name the user typed.
+# Remove this section to reject unknown names instead of forwarding to virsh.
+# ---------------------------------------------------------------------------
+defaults:
+  console:
+    type: exec
+    cmd: "virsh -c qemu:///system console {name} --force"
+    run_as: _vnctlsd
+
 # Management commands — config-driven, validated by monitor before execution
 # {name} is substituted with the console name (validated against VM_NAME_RE)
 #
@@ -346,43 +361,38 @@ commands:
         - [Memory,  "{memory_mb} MB"]
         - [vCPUs,   "{vcpus}"]
 
-# Explicit console definitions (highest priority over patterns)
+# Explicit console definitions (highest priority — checked first)
+# Use for VMs that need per-console ACL overrides or non-default settings.
 consoles:
-  special-vm:
-    type: exec
-    cmd: "virsh -c qemu:///system console special-vm --force"
-    run_as: _vnctlsd
-    rw: [admins]
-    ro: [mentors]
+  vm-special:
+    type: qemu_unix
+    socket: /run/vnctlsd/console-vm-special.sock
     validation:
-      trusted_uid: root        # per-console override
+      trusted_uid: root        # override: this socket is owned by root
+    rw: [admin]
+    ro: [mentors]
 
-# Pattern-based definitions (matched when no explicit definition applies)
-# {name} is extracted from the socket filename via glob capture
+# Pattern-based definitions — matched by socket filename, qemu_unix only.
+# socket_glob is for socket-backed transports exclusively.  exec consoles
+# that don't watch a socket use the defaults.console fallback above.
+# {name} is extracted from the socket path via glob capture.
 console_patterns:
-  # QEMU creates the socket at VM boot; daemon connects — hub live before any user attaches
+  # QEMU creates the socket at VM boot (libvirt mode="bind"); daemon connects.
+  # Hub is live before any user attaches, capturing BIOS/GRUB/kernel output.
   - socket_glob: /run/vnctlsd/console-{name}.sock
     type: qemu_unix
     console_name: "{name}"
     validation:
       trusted_uid: libvirt-qemu
     rw: ["{name}"]             # username matching VM name → read-write
-    ro: [mentors]              # mentors group → read-only
-
-  # Exec-on-demand: daemon spawns virsh when user requests console
-  - socket_glob: /run/vnctlsd/exec-{name}.sock
-    type: exec
-    console_name: "{name}"
-    cmd: "virsh -c qemu:///system console {name} --force"
-    run_as: _vnctlsd
-    rw: ["{name}"]
-    ro: [mentors]
+    ro: [mentors]              # mentors group → read-only on all VMs
 ```
 
 ### ACL resolution order
 
 1. Console definition `rw`/`ro` lists (most specific — checked first)
-2. User map group role (fallback when console has no explicit ACL)
+2. User map group role (fallback when console has no explicit ACL, including
+   when the `defaults.console` backend is used)
 3. `*` in an ACL list matches all authenticated users
 4. Template variables from glob captures are substituted before matching
    (`rw: ["{name}"]` with `name=vm-lab01` → matches username `vm-lab01`)
@@ -423,6 +433,13 @@ owns the socket; the daemon's watcher detects it and connects:
 QEMU creates the socket file at VM boot and listens on it. The daemon
 connects when the socket appears in the watch directory. The hub is live
 from the first BIOS byte, capturing all output before any user attaches.
+
+**Socket exclusivity**: once the daemon connects, it is the only consumer of
+the QEMU socket. The daemon fans output out to all attached clients itself.
+Filesystem permissions on `/run/vnctlsd/` (mode `0750`, group `_vnctlsd`)
+must prevent other local processes from connecting to the socket directly,
+since a second connect would race with the daemon and could steal console
+output.
 
 ---
 
@@ -549,8 +566,8 @@ Password:
 Login successful.
 
 vnctlsd> list
-  vm-lab01                       live          1 watcher(s)  [read_write]
-  vm-lab02                       idle          0 watcher(s)  [read_write]
+  vm-lab01                       live          1 client(s)  [read_write]
+  vm-lab02                       idle          0 client(s)  [read_write]
 
 vnctlsd> status vm-lab01
 running
@@ -792,3 +809,6 @@ command with structured output requires only config changes, no code changes.
   abstraction is in place; `FileACLResolver` is the only current backend)
 - `qemu_unix` console patterns require QEMU to be configured to use unix
   socket serial output (libvirt domain XML change per VM)
+- `list` shows explicitly-defined consoles and currently-active hubs only.
+  Consoles reachable via `defaults.console` are not enumerated (the daemon
+  has no way to discover what VM names exist without an external source).
