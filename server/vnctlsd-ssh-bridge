@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-vnctlsd SSH subsystem bridge.
+vnctlsd SSH access command.
 
-Configured in sshd_config as:
-    Subsystem vnctlsd /usr/local/libexec/vnctlsd-ssh-bridge
+Install on the server in a PATH-visible location (e.g. /usr/bin/) so that
+users can reach vnctlsd consoles over SSH without any sshd_config changes:
+
+    ssh <host> vnctlsd-ssh-bridge
 
 sshd authenticates the user (key, password, MFA — whatever the site policy
-requires), then executes this script as that user.  The script's only job is
+requires) and executes this command as that user.  The command's only job is
 to connect to vnctlsd's Unix socket and pipe stdin/stdout through it.
 
 Identity is established entirely by the kernel: the daemon reads SO_PEERCRED
 on the accepted connection and sees this process's uid.  Because sshd drops
-privileges to the authenticated user before exec'ing the subsystem, that uid
-is the authenticated user's uid.  No credential or claim is sent by this
-script — none would be trusted anyway.
+privileges to the authenticated user before exec'ing the command, that uid is
+the authenticated user's uid.  No credential or claim is sent by this command
+— none would be trusted anyway.
 """
 import argparse
 import os
@@ -60,7 +62,7 @@ def _check_socket(path: str) -> str | None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="vnctlsd-ssh-bridge",
-        description="vnctlsd SSH subsystem bridge")
+        description="vnctlsd SSH access command")
     parser.add_argument(
         "--socket", default=_DEFAULT_SOCKET, metavar="PATH",
         help=f"vnctlsd socket path (default: {_DEFAULT_SOCKET})")

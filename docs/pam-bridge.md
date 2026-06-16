@@ -123,7 +123,7 @@ a username via the monitor (which can read `/etc/passwd`), and applies ACL
 rules from `users.yaml`.
 
 The daemon does not know or care how the client authenticated.  A PAM-bridge
-session and an SSH-subsystem session are indistinguishable to the daemon;
+session and an SSH session (via vnctlsd-ssh-bridge) are indistinguishable to the daemon;
 both are identified by uid alone.
 
 ## Installation

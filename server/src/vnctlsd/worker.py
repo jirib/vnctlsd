@@ -529,7 +529,7 @@ def handle_trusted_client(client_sock: socket.socket,
     applied to the worker.
 
     For the SSH bridge the connecting process IS the authenticated user
-    (sshd drops privileges before exec'ing the subsystem).  For the PAM
+    (sshd drops privileges before exec'ing the command).  For the PAM
     bridge the connecting process is a per-session child that dropped to the
     authenticated user's uid after a successful PAM verification.  In both
     cases the kernel-reported uid is authoritative; no client-supplied claim

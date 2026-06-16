@@ -2,7 +2,7 @@
 //
 // The server drives everything: login prompt, command menu, console stream.
 // The client is a dumb pipe — either raw terminal mode + bidirectional TLS I/O
-// or an OpenSSH subsystem invocation.
+// or an SSH invocation of vnctlsd-ssh-bridge on the server.
 //
 // TLS usage:
 //   vnctl -server foo.example.com:8443

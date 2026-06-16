@@ -12,22 +12,22 @@ import (
 // --- buildSSHArgv ---
 
 func TestBuildSSHArgvExpandsServerToken(t *testing.T) {
-	got, err := buildSSHArgv("console.example.com", "ssh -s {server} vnctlsd")
+	got, err := buildSSHArgv("console.example.com", "ssh {server} vnctlsd-ssh-bridge")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"ssh", "-s", "console.example.com", "vnctlsd"}
+	want := []string{"ssh", "console.example.com", "vnctlsd-ssh-bridge"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
 	}
 }
 
 func TestBuildSSHArgvExpandsServerTokenWithExtraFlags(t *testing.T) {
-	got, err := buildSSHArgv("console.example.com", "ssh -p 2222 -s {server} vnctlsd")
+	got, err := buildSSHArgv("console.example.com", "ssh -p 2222 {server} vnctlsd-ssh-bridge")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"ssh", "-p", "2222", "-s", "console.example.com", "vnctlsd"}
+	want := []string{"ssh", "-p", "2222", "console.example.com", "vnctlsd-ssh-bridge"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
 	}
@@ -36,11 +36,11 @@ func TestBuildSSHArgvExpandsServerTokenWithExtraFlags(t *testing.T) {
 func TestBuildSSHArgvServerWithSpaceIsNotReSplit(t *testing.T) {
 	// A server value containing a space must be kept as a single token, not
 	// re-split by strings.Fields after substitution.
-	got, err := buildSSHArgv("user name@host", "ssh -s {server} vnctlsd")
+	got, err := buildSSHArgv("user name@host", "ssh {server} vnctlsd-ssh-bridge")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"ssh", "-s", "user name@host", "vnctlsd"}
+	want := []string{"ssh", "user name@host", "vnctlsd-ssh-bridge"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
 	}
@@ -108,7 +108,7 @@ func TestRunSSHInvokesConfiguredClient(t *testing.T) {
 
 	// runSSH calls os.Exit only on non-zero exit or pre-exec failure.
 	// The fake script exits 0 so runSSH returns normally here.
-	runSSH("console.example.com", sshPath+" -s {server} vnctlsd")
+	runSSH("console.example.com", sshPath+" {server} vnctlsd-ssh-bridge")
 
 	raw, err := os.ReadFile(argsPath)
 	if err != nil {
@@ -116,15 +116,15 @@ func TestRunSSHInvokesConfiguredClient(t *testing.T) {
 	}
 	got := strings.Fields(string(raw))
 	// argv[0] (sshPath) is not in $@ — only the arguments are captured.
-	want := []string{"-s", "console.example.com", "vnctlsd"}
+	want := []string{"console.example.com", "vnctlsd-ssh-bridge"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ssh args = %#v, want %#v", got, want)
 	}
 }
 
-// TestSSHHandshakeAndAuthIntegration requires a real SSH server with the
-// vnctlsd subsystem configured.  Set VNCTL_SSH_TEST_SERVER and optionally
-// VNCTL_SSH_TEST_ARGS to enable.
+// TestSSHHandshakeAndAuthIntegration requires a real SSH server with
+// vnctlsd-ssh-bridge installed in PATH.  Set VNCTL_SSH_TEST_SERVER and
+// optionally VNCTL_SSH_TEST_ARGS to enable.
 func TestSSHHandshakeAndAuthIntegration(t *testing.T) {
 	server := os.Getenv("VNCTL_SSH_TEST_SERVER")
 	if server == "" {
@@ -132,7 +132,7 @@ func TestSSHHandshakeAndAuthIntegration(t *testing.T) {
 	}
 	sshArgs := os.Getenv("VNCTL_SSH_TEST_ARGS")
 	if sshArgs == "" {
-		sshArgs = "ssh -o BatchMode=yes -o ConnectTimeout=5 -s {server} vnctlsd"
+		sshArgs = "ssh -o BatchMode=yes -o ConnectTimeout=5 {server} vnctlsd-ssh-bridge"
 	}
 	// runSSH calls os.Exit on SSH failure, which would kill the test process.
 	// This test is intended for manual validation with a working server.

@@ -1,24 +1,26 @@
-// SSH subsystem mode.
+// SSH mode.
 //
-// Instead of a TLS connection, vnctl invokes an SSH client that requests the
-// vnctlsd subsystem on the remote host.  sshd authenticates the user (keys,
+// Instead of a TLS connection, vnctl invokes an SSH client that runs
+// vnctlsd-ssh-bridge on the remote host.  sshd authenticates the user (keys,
 // certificates, MFA — whatever the site policy requires) and executes the
-// vnctlsd-ssh-bridge on the server, which connects to the daemon's trusted
-// Unix socket.  The bridge pipes stdin/stdout straight through; the daemon
-// identifies the caller from the kernel-reported peer credentials (SO_PEERCRED)
-// so no password is exchanged with vnctlsd itself.
+// command as that user.  The command connects to the daemon's trusted Unix
+// socket and pipes stdin/stdout straight through; the daemon identifies the
+// caller from the kernel-reported peer credentials (SO_PEERCRED) so no
+// password is exchanged with vnctlsd itself.
+//
+// vnctlsd-ssh-bridge must be installed in PATH on the server (e.g. /usr/bin/).
+// No sshd_config changes are required.
 //
 // The SSH binary and its arguments are controlled by -ssh-args (default below).
 // {server} in any token is replaced with the -server value.  The SSH binary
-// must appear first.  No -t flag: the subsystem bridge is a raw pipe, not a
-// terminal application, and an extra server-side pty would corrupt the console
-// byte stream.
+// must appear first.  No -t flag: the command is a raw pipe, not a terminal
+// application, and an extra server-side pty would corrupt the console byte stream.
 //
 // Custom port example:
-//   vnctl -mode ssh -server user@host -ssh-args "ssh -p 2222 -s {server} vnctlsd"
+//   vnctl -mode ssh -server user@host -ssh-args "ssh -p 2222 {server} vnctlsd-ssh-bridge"
 //
 // ProxyJump example:
-//   vnctl -mode ssh -server host -ssh-args "ssh -J bastion -s {server} vnctlsd"
+//   vnctl -mode ssh -server host -ssh-args "ssh -J bastion {server} vnctlsd-ssh-bridge"
 
 package main
 
@@ -32,9 +34,8 @@ import (
 
 // defaultSSHArgs is the SSH command template used when -ssh-args is not set.
 // {server} is replaced with the -server value by buildSSHArgv.
-// -s requests subsystem mode; vnctlsd is the subsystem name.
-// No -t: the bridge is a dumb pipe, not a pty application.
-const defaultSSHArgs = "ssh -s {server} vnctlsd"
+// No -t: vnctlsd-ssh-bridge is a dumb pipe, not a pty application.
+const defaultSSHArgs = "ssh {server} vnctlsd-ssh-bridge"
 
 func runSSH(server, sshArgs string) {
 	if server == "" {
@@ -97,7 +98,7 @@ func buildSSHArgv(server, sshArgs string) ([]string, error) {
 	if !found {
 		return nil, fmt.Errorf(
 			"-ssh-args %q does not contain {server}; cannot insert %q\n"+
-				"  hint: use e.g. \"ssh -s {server} vnctlsd\"",
+				"  hint: use e.g. \"ssh {server} vnctlsd-ssh-bridge\"",
 			sshArgs, server)
 	}
 	return out, nil
@@ -118,6 +119,6 @@ func validateSSHServer(server string) error {
 	return fmt.Errorf(
 		"-server %q looks like a host:port address\n"+
 			"  for -mode ssh use just the host (e.g. -server %q)\n"+
-			"  to specify a non-standard port add it to -ssh-args (e.g. \"ssh -p %s -s {server} vnctlsd\")",
+			"  to specify a non-standard port add it to -ssh-args (e.g. \"ssh -p %s {server} vnctlsd-ssh-bridge\")",
 		server, hint, port)
 }
