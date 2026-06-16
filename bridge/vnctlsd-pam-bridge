@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""
+vnctlsd PAM authentication bridge.
+
+Listens on a TCP or Unix socket (behind a TLS terminator such as HAProxy or
+stunnel), drives the PAM login flow, then — on success — execs the setuid
+helper (vnctl-user-pipe) as a child process.  The helper drops to the
+authenticated user's uid/gid and connects to vnctlsd's Unix socket.  The
+daemon identifies the user via SO_PEERCRED; no credential or claim is sent.
+
+This bridge runs as _vnctlsd (not root).  Privilege transition to the
+authenticated user is performed entirely by the setuid helper binary.
+
+PAM credential verification runs in a short-lived grandchild (fork → verify →
+_exit) so the plaintext password is never resident in the long-lived process.
+
+Usage:
+    vnctlsd-pam-bridge [options]
+
+Options:
+    --listen HOST:PORT | /path/to/socket
+        Where to accept client connections.  A value starting with '/' is a
+        Unix socket; otherwise host:port TCP.  Default: 127.0.0.1:8443
+
+    --helper PATH
+        Path to the vnctl-user-pipe setuid binary.
+        Default: /usr/libexec/vnctl-user-pipe
+
+    --login-timeout SECONDS
+        Max seconds to wait for username + password.  Default: 30
+
+    --max-failures N        Max failed attempts before lockout.  Default: 5
+    --failure-window SECS   Sliding window for failure counting.  Default: 120
+    --lockout-duration SECS Lockout length after max failures.  Default: 60
+"""
+import argparse
+import ctypes
+import ctypes.util
+import logging
+import os
+import resource
+import signal
+import socket
+import sys
+import threading
+import time
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("vnctlsd-pam-bridge")
+
+# ---------------------------------------------------------------------------
+# PAM
+# ---------------------------------------------------------------------------
+
+PAM_SUCCESS = 0
+PAM_PROMPT_ECHO_OFF = 1
+PAM_PROMPT_ECHO_ON = 2
+PAM_ERROR_MSG = 3
+PAM_TEXT_INFO = 4
+
+
+class _PamMessage(ctypes.Structure):
+    _fields_ = [("msg_style", ctypes.c_int), ("msg", ctypes.c_char_p)]
+
+
+class _PamResponse(ctypes.Structure):
+    _fields_ = [("resp", ctypes.c_void_p), ("resp_retcode", ctypes.c_int)]
+
+
+_CONV_FUNC = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_int,
+    ctypes.POINTER(ctypes.POINTER(_PamMessage)),
+    ctypes.POINTER(ctypes.POINTER(_PamResponse)),
+    ctypes.c_void_p,
+)
+
+
+class _PamConv(ctypes.Structure):
+    _fields_ = [("conv", _CONV_FUNC), ("appdata_ptr", ctypes.c_void_p)]
+
+
+_libc = ctypes.CDLL(ctypes.util.find_library("c"))
+_libc.calloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+_libc.calloc.restype = ctypes.c_void_p
+_libc.strdup.argtypes = [ctypes.c_char_p]
+_libc.strdup.restype = ctypes.c_void_p
+
+_pam_lib = ctypes.util.find_library("pam")
+if not _pam_lib:
+    log.error("libpam not found")
+    sys.exit(1)
+
+_pam = ctypes.CDLL(_pam_lib)
+_pam.pam_start.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                            ctypes.POINTER(_PamConv),
+                            ctypes.POINTER(ctypes.c_void_p)]
+_pam.pam_start.restype = ctypes.c_int
+_pam.pam_authenticate.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_pam.pam_authenticate.restype = ctypes.c_int
+_pam.pam_acct_mgmt.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_pam.pam_acct_mgmt.restype = ctypes.c_int
+_pam.pam_end.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_pam.pam_end.restype = ctypes.c_int
+
+
+def _pam_verify(username: str, password: str, service: str = "login") -> bool:
+    u, p, s = username.encode(), password.encode(), service.encode()
+
+    def conv_cb(num_msg, msg, resp, _):
+        addr = _libc.calloc(num_msg, ctypes.sizeof(_PamResponse))
+        if not addr:
+            return 1
+        arr = ctypes.cast(addr, ctypes.POINTER(_PamResponse))
+        for i in range(num_msg):
+            style = msg[i].contents.msg_style
+            if style == PAM_PROMPT_ECHO_OFF:
+                arr[i].resp = _libc.strdup(p)
+                arr[i].resp_retcode = 0
+            elif style == PAM_PROMPT_ECHO_ON:
+                arr[i].resp = _libc.strdup(u)
+                arr[i].resp_retcode = 0
+            elif style in (PAM_ERROR_MSG, PAM_TEXT_INFO):
+                arr[i].resp = None
+                arr[i].resp_retcode = 0
+            else:
+                return 1
+        resp[0] = arr
+        return PAM_SUCCESS
+
+    cb = _CONV_FUNC(conv_cb)
+    conv = _PamConv(cb, None)
+    handle = ctypes.c_void_p()
+
+    if _pam.pam_start(s, u, ctypes.byref(conv),
+                      ctypes.byref(handle)) != PAM_SUCCESS:
+        return False
+    rc = _pam.pam_authenticate(handle, 0)
+    if rc != PAM_SUCCESS:
+        _pam.pam_end(handle, rc)
+        return False
+    rc = _pam.pam_acct_mgmt(handle, 0)
+    _pam.pam_end(handle, PAM_SUCCESS)
+    return rc == PAM_SUCCESS
+
+
+def _verify_subprocess(username: str, password: str) -> bool:
+    """PAM in a short-lived grandchild — password freed by OS on exit."""
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r_fd)
+            # Prevent the grandchild from gaining new privileges.
+            try:
+                PR_SET_NO_NEW_PRIVS = 38
+                _libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+            except Exception:
+                pass
+            resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
+            resource.setrlimit(resource.RLIMIT_NOFILE, (16, 16))
+            ok = _pam_verify(username, password)
+            os.write(w_fd, b'\x01' if ok else b'\x00')
+        except Exception:
+            try:
+                os.write(w_fd, b'\x00')
+            except Exception:
+                pass
+        finally:
+            try:
+                os.close(w_fd)
+            except Exception:
+                pass
+        os._exit(0)
+
+    os.close(w_fd)
+    try:
+        result = os.read(r_fd, 1)
+    except OSError:
+        result = b'\x00'
+    finally:
+        os.close(r_fd)
+    try:
+        os.waitpid(pid, 0)
+    except Exception:
+        pass
+    return result == b'\x01'
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    def __init__(self, max_failures: int, failure_window: float,
+                 lockout_duration: float):
+        self._max = max_failures
+        self._window = failure_window
+        self._lockout = lockout_duration
+        self._lock = threading.Lock()
+        self._state: dict = {}
+
+    def is_limited(self, username: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            s = self._state.get(username)
+            return s is not None and s.get('locked_until', 0) > now
+
+    def record_failure(self, username: str):
+        now = time.monotonic()
+        with self._lock:
+            s = self._state.setdefault(username,
+                                       {'failures': [], 'locked_until': 0.0})
+            s['failures'] = [t for t in s['failures']
+                             if now - t < self._window]
+            s['failures'].append(now)
+            if len(s['failures']) >= self._max:
+                s['locked_until'] = now + self._lockout
+                log.warning("Rate limit: locked out %r for %.0fs",
+                            username, self._lockout)
+                s['failures'] = []
+
+    def record_success(self, username: str):
+        with self._lock:
+            self._state.pop(username, None)
+
+    def reap(self):
+        now = time.monotonic()
+        with self._lock:
+            stale = [
+                u for u, s in self._state.items()
+                if s.get('locked_until', 0) < now and
+                   all(now - t > self._window for t in s.get('failures', []))
+            ]
+            for u in stale:
+                del self._state[u]
+
+
+# ---------------------------------------------------------------------------
+# Socket helpers
+# ---------------------------------------------------------------------------
+
+BANNER = (
+    b"\r\nvnctlsd - virsh console dispatcher\r\n"
+    b"Type 'help' for available commands.\r\n\r\n"
+)
+
+_BUFSIZE = 65536
+
+
+def _sock_readline(sock: socket.socket, echo: bool = True,
+                   max_len: int = 256) -> bytes | None:
+    buf = bytearray()
+    while True:
+        try:
+            ch = sock.recv(1)
+        except OSError:
+            return None
+        if not ch:
+            return None
+        b = ch[0]
+        if b in (0x0d, 0x0a):
+            if echo:
+                sock.sendall(b"\r\n")
+            break
+        if b in (0x7f, 0x08):
+            if buf:
+                buf.pop()
+                if echo:
+                    sock.sendall(b"\b \b")
+            continue
+        if b == 0x03:
+            return None
+        if len(buf) < max_len:
+            buf.append(b)
+            if echo:
+                sock.sendall(ch)
+    return bytes(buf)
+
+
+# ---------------------------------------------------------------------------
+# Per-connection handling
+# ---------------------------------------------------------------------------
+
+def _authenticate(client_sock: socket.socket,
+                  rate_limiter: RateLimiter,
+                  login_timeout: int) -> str | None:
+    """
+    Drive PAM login on client_sock.  Returns the authenticated username on
+    success, None on any failure or timeout.
+    """
+    _MIN_LOGIN_TIME = 2.0
+
+    client_sock.settimeout(login_timeout)
+    client_sock.sendall(BANNER)
+
+    client_sock.sendall(b"Username: ")
+    ub = _sock_readline(client_sock, echo=True)
+    if not ub:
+        return None
+    username = ub.decode('utf-8', errors='replace').strip()
+    if not username:
+        return None
+
+    client_sock.sendall(b"Password: ")
+    pb = _sock_readline(client_sock, echo=False)
+    if pb is None:
+        return None
+    password = pb.decode('utf-8', errors='replace')
+
+    if rate_limiter.is_limited(username):
+        time.sleep(2)
+        client_sock.sendall(b"\r\nLogin failed.\r\n")
+        return None
+
+    login_start = time.monotonic()
+
+    def _fail(reason: str) -> None:
+        log.warning("Login denied: user=%r reason=%s", username, reason)
+        rate_limiter.record_failure(username)
+        remaining = _MIN_LOGIN_TIME - (time.monotonic() - login_start)
+        if remaining > 0:
+            time.sleep(remaining)
+        try:
+            client_sock.sendall(b"\r\nLogin failed.\r\n")
+        except Exception:
+            pass
+
+    if not _verify_subprocess(username, password):
+        _fail("bad_credentials")
+        return None
+
+    rate_limiter.record_success(username)
+    log.info("PAM auth ok: user=%r", username)
+    return username
+
+
+def _spawn_helper(client_sock: socket.socket,
+                  helper_path: str,
+                  username: str) -> None:
+    """
+    Fork a child that execs the setuid helper with the client socket as
+    stdin/stdout.  The child is immediately replaced by the C binary via
+    execv(), so it never returns to any Python threading state.
+
+    The parent closes its copy of the client socket and returns; the helper
+    process owns the session and the connection.
+    """
+    client_fd = client_sock.fileno()
+    child_pid = os.fork()
+    if child_pid == 0:
+        try:
+            # Wire client socket to stdin/stdout for the helper.
+            os.dup2(client_fd, 0)
+            os.dup2(client_fd, 1)
+            # Helper closes extra FDs itself after applying seccomp.
+            os.execv(helper_path, ['vnctl-user-pipe', '--user', username])
+        except Exception:
+            pass
+        os._exit(1)
+
+    # Parent: release our file-descriptor copy.
+    # Do NOT call shutdown() here — the child shares the underlying socket.
+    try:
+        client_sock.close()
+    except OSError:
+        pass
+
+
+def _handle_connection(client_sock: socket.socket,
+                       helper_path: str,
+                       rate_limiter: RateLimiter,
+                       login_timeout: int) -> None:
+    """
+    Handle one client connection in a thread.
+
+    Authenticates via PAM, then forks a child that execs the setuid helper.
+    The helper performs privilege drop and bridges the session.
+    """
+    username = None
+    try:
+        username = _authenticate(client_sock, rate_limiter, login_timeout)
+    except TimeoutError:
+        try:
+            client_sock.sendall(b"\r\n[Login timeout.]\r\n")
+        except Exception:
+            pass
+    except Exception:
+        log.exception("Auth error")
+
+    if username is None:
+        try:
+            client_sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            client_sock.close()
+        except OSError:
+            pass
+        return
+
+    log.info("Spawning helper: user=%r", username)
+    _spawn_helper(client_sock, helper_path, username)
+
+
+# ---------------------------------------------------------------------------
+# Listen socket factory
+# ---------------------------------------------------------------------------
+
+def _create_listen_socket(listen: str) -> socket.socket:
+    if listen.startswith('/'):
+        if os.path.exists(listen):
+            os.unlink(listen)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(listen)
+        sock.listen(128)
+        os.chmod(listen, 0o660)
+        log.info("Listening on Unix socket %s", listen)
+    else:
+        if ':' not in listen:
+            sys.stderr.write(
+                f"--listen must be HOST:PORT or /path, got: {listen!r}\n")
+            sys.exit(1)
+        host, _, port_str = listen.rpartition(':')
+        try:
+            port = int(port_str)
+        except ValueError:
+            sys.stderr.write(f"Invalid port in --listen {listen!r}\n")
+            sys.exit(1)
+        family = (socket.AF_INET6 if ':' in host.strip('[]')
+                  else socket.AF_INET)
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.listen(128)
+        log.info("Listening on TCP %s:%d", host, port)
+    return sock
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="vnctlsd-pam-bridge",
+        description="vnctlsd PAM authentication bridge")
+    parser.add_argument("--listen", default="127.0.0.1:8443", metavar="ADDR",
+                        help="Listen address: HOST:PORT or /path/to/socket")
+    parser.add_argument("--helper", default="/usr/libexec/vnctl-user-pipe",
+                        metavar="PATH",
+                        help="Path to the vnctl-user-pipe setuid helper")
+    parser.add_argument("--login-timeout", type=int, default=30,
+                        metavar="SECONDS")
+    parser.add_argument("--max-failures", type=int, default=5)
+    parser.add_argument("--failure-window", type=float, default=120.0,
+                        metavar="SECONDS")
+    parser.add_argument("--lockout-duration", type=float, default=60.0,
+                        metavar="SECONDS")
+    args = parser.parse_args()
+
+    if not os.path.isfile(args.helper):
+        sys.stderr.write(
+            f"vnctlsd-pam-bridge: helper not found: {args.helper}\n")
+        sys.exit(1)
+    if not os.access(args.helper, os.X_OK):
+        sys.stderr.write(
+            f"vnctlsd-pam-bridge: helper not executable: {args.helper}\n")
+        sys.exit(1)
+
+    # Reap child processes that have finished their sessions.
+    def _sigchld(signum, frame):
+        try:
+            while True:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+        except ChildProcessError:
+            pass
+
+    signal.signal(signal.SIGCHLD, _sigchld)
+
+    rate_limiter = RateLimiter(
+        args.max_failures, args.failure_window, args.lockout_duration)
+
+    def _reaper():
+        while True:
+            time.sleep(60)
+            rate_limiter.reap()
+
+    threading.Thread(target=_reaper, daemon=True, name='reaper').start()
+
+    listen_sock = _create_listen_socket(args.listen)
+
+    while True:
+        try:
+            client_sock, peer = listen_sock.accept()
+        except (KeyboardInterrupt, OSError):
+            break
+        except Exception:
+            log.exception("Accept error")
+            continue
+
+        log.debug("Connection from %r", peer)
+        threading.Thread(
+            target=_handle_connection,
+            args=(client_sock, args.helper,
+                  rate_limiter, args.login_timeout),
+            daemon=True,
+            name=f"conn-{peer}",
+        ).start()
+
+
+if __name__ == "__main__":
+    main()
