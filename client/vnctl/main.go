@@ -33,7 +33,8 @@ func main() {
 	certFile := flag.String("cert", "", "client certificate `file` (PEM)")
 	keyFile  := flag.String("key",  "", "client key `file` (PEM)")
 	caFile   := flag.String("ca",   "", "CA certificate `file` (PEM) for server verification")
-	sshArgs  := flag.String("ssh-args", defaultSSHArgs, "")
+	sshBin  := flag.String("ssh-bin",  defaultSSHBin, "")
+	sshArgs := flag.String("ssh-args", "",            "")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags]\n\nFlags:\n", os.Args[0])
@@ -50,7 +51,7 @@ func main() {
 	case "tls":
 		runTLS(*server, *insecure, *certFile, *keyFile, *caFile)
 	case "ssh":
-		runSSH(*server, *sshArgs)
+		runSSH(*server, *sshBin, *sshArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "vnctl: unknown -mode %q\n", *mode)
 		os.Exit(1)

@@ -121,22 +121,22 @@ run = "uv run pytest"
 [tasks."build:vnctl:linux-amd64"]
 description = "Build vnctl for Linux (amd64)"
 dir = "{{ config_root }}/client/vnctl"
-run = "GOOS=linux GOARCH=amd64 go build -o ../../build/bin/vnctl-linux-amd64 main.go"
+run = "GOOS=linux GOARCH=amd64 go build -o ../../build/bin/vnctl-linux-amd64 ."
 
 [tasks."build:vnctl:windows-amd64"]
 description = "Build vnctl for Windows (amd64)"
 dir = "{{ config_root }}/client/vnctl"
-run = "GOOS=windows GOARCH=amd64 go build -o ../../build/bin/vnctl-windows-amd64.exe main.go"
+run = "GOOS=windows GOARCH=amd64 go build -o ../../build/bin/vnctl-windows-amd64.exe ."
 
 [tasks."build:vnctl:mac-intel"]
 description = "Build vnctl for older Intel Macs (amd64)"
 dir = "{{ config_root }}/client/vnctl"
-run = "GOOS=darwin GOARCH=amd64 go build -o ../../build/bin/vnctl-darwin-amd64 main.go"
+run = "GOOS=darwin GOARCH=amd64 go build -o ../../build/bin/vnctl-darwin-amd64 ."
 
 [tasks."build:vnctl:mac-silicon"]
 description = "Build vnctl for Apple Silicon Macs (arm64)"
 dir = "{{ config_root }}/client/vnctl"
-run = "GOOS=darwin GOARCH=arm64 go build -o ../../build/bin/vnctl-darwin-arm64 main.go"
+run = "GOOS=darwin GOARCH=arm64 go build -o ../../build/bin/vnctl-darwin-arm64 ."
 
 [tasks."build:vnctl"]
 description = "Build vnctl for ALL target platforms simultaneously"

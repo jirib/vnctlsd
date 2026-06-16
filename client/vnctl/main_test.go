@@ -9,60 +9,6 @@ import (
 	"testing"
 )
 
-// --- buildSSHArgv ---
-
-func TestBuildSSHArgvExpandsServerToken(t *testing.T) {
-	got, err := buildSSHArgv("console.example.com", "ssh {server} vnctlsd-ssh-bridge")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	want := []string{"ssh", "console.example.com", "vnctlsd-ssh-bridge"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %#v, want %#v", got, want)
-	}
-}
-
-func TestBuildSSHArgvExpandsServerTokenWithExtraFlags(t *testing.T) {
-	got, err := buildSSHArgv("console.example.com", "ssh -p 2222 {server} vnctlsd-ssh-bridge")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	want := []string{"ssh", "-p", "2222", "console.example.com", "vnctlsd-ssh-bridge"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %#v, want %#v", got, want)
-	}
-}
-
-func TestBuildSSHArgvServerWithSpaceIsNotReSplit(t *testing.T) {
-	// A server value containing a space must be kept as a single token, not
-	// re-split by strings.Fields after substitution.
-	got, err := buildSSHArgv("user name@host", "ssh {server} vnctlsd-ssh-bridge")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	want := []string{"ssh", "user name@host", "vnctlsd-ssh-bridge"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %#v, want %#v", got, want)
-	}
-}
-
-func TestBuildSSHArgvErrorOnMissingServerPlaceholder(t *testing.T) {
-	_, err := buildSSHArgv("console.example.com", "ssh -s console.example.com vnctlsd")
-	if err == nil {
-		t.Fatal("expected error for template without {server}, got nil")
-	}
-	if !strings.Contains(err.Error(), "{server}") {
-		t.Fatalf("error should mention {server}, got: %v", err)
-	}
-}
-
-func TestBuildSSHArgvErrorOnEmptyTemplate(t *testing.T) {
-	_, err := buildSSHArgv("host", "")
-	if err == nil {
-		t.Fatal("expected error for empty -ssh-args, got nil")
-	}
-}
-
 // --- validateSSHServer ---
 
 func TestValidateSSHServerAcceptsPlainHost(t *testing.T) {
@@ -91,7 +37,7 @@ func TestValidateSSHServerRejectsIPv6WithPort(t *testing.T) {
 
 // --- runSSH (integration with fake ssh binary) ---
 
-func TestRunSSHInvokesConfiguredClient(t *testing.T) {
+func TestRunSSHInvokesSSHWithServerAndCommand(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake ssh shell script test requires a Unix shell")
 	}
@@ -99,24 +45,48 @@ func TestRunSSHInvokesConfiguredClient(t *testing.T) {
 	tmp := t.TempDir()
 	argsPath := filepath.Join(tmp, "args.txt")
 	sshPath := filepath.Join(tmp, "fake-ssh")
-	// Record all argv (excluding $0) to a file and exit 0.
 	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$VNCTL_FAKE_SSH_ARGS\"\n"
 	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake ssh: %v", err)
 	}
 	t.Setenv("VNCTL_FAKE_SSH_ARGS", argsPath)
 
-	// runSSH calls os.Exit only on non-zero exit or pre-exec failure.
-	// The fake script exits 0 so runSSH returns normally here.
-	runSSH("console.example.com", sshPath+" {server} vnctlsd-ssh-bridge")
+	runSSH("console.example.com", sshPath, "")
+
+	raw, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read captured args: %v", err)
+	}
+	// argv[0] (sshPath) is excluded from $@ — only the arguments are captured.
+	got := strings.Fields(string(raw))
+	want := []string{"console.example.com", "vnctlsd-ssh-bridge"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ssh args = %#v, want %#v", got, want)
+	}
+}
+
+func TestRunSSHPrependsExtraArgs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ssh shell script test requires a Unix shell")
+	}
+
+	tmp := t.TempDir()
+	argsPath := filepath.Join(tmp, "args.txt")
+	sshPath := filepath.Join(tmp, "fake-ssh")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$VNCTL_FAKE_SSH_ARGS\"\n"
+	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ssh: %v", err)
+	}
+	t.Setenv("VNCTL_FAKE_SSH_ARGS", argsPath)
+
+	runSSH("host", sshPath, "-p 2222 -l alice")
 
 	raw, err := os.ReadFile(argsPath)
 	if err != nil {
 		t.Fatalf("read captured args: %v", err)
 	}
 	got := strings.Fields(string(raw))
-	// argv[0] (sshPath) is not in $@ — only the arguments are captured.
-	want := []string{"console.example.com", "vnctlsd-ssh-bridge"}
+	want := []string{"-p", "2222", "-l", "alice", "host", "vnctlsd-ssh-bridge"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ssh args = %#v, want %#v", got, want)
 	}
@@ -130,11 +100,11 @@ func TestSSHHandshakeAndAuthIntegration(t *testing.T) {
 	if server == "" {
 		t.Skip("set VNCTL_SSH_TEST_SERVER to run the real SSH handshake/auth test")
 	}
-	sshArgs := os.Getenv("VNCTL_SSH_TEST_ARGS")
-	if sshArgs == "" {
-		sshArgs = "ssh -o BatchMode=yes -o ConnectTimeout=5 {server} vnctlsd-ssh-bridge"
+	extraArgs := os.Getenv("VNCTL_SSH_TEST_ARGS")
+	if extraArgs == "" {
+		extraArgs = "-o BatchMode=yes -o ConnectTimeout=5"
 	}
 	// runSSH calls os.Exit on SSH failure, which would kill the test process.
 	// This test is intended for manual validation with a working server.
-	runSSH(server, sshArgs)
+	runSSH(server, defaultSSHBin, extraArgs)
 }
