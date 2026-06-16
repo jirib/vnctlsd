@@ -132,11 +132,12 @@ valid_username(const char *s)
  *
  * Checks are done with lstat() before connect() to reduce the TOCTOU window.
  * The residual risk is bounded by the parent-directory invariants below: only
- * root can create or replace files in a root-owned, non-writable directory.
+ * _vnctlsd can create or replace files in the _vnctlsd-owned, non-writable
+ * directory.
  * ------------------------------------------------------------------------- */
 
 static void
-check_daemon_socket(const char *path)
+check_daemon_socket(const char *path, uid_t daemon_uid)
 {
     char dir[256];
     struct stat st;
@@ -152,8 +153,8 @@ check_daemon_socket(const char *path)
 
     if (lstat(dir, &st) != 0)
         die("stat socket directory");
-    if (st.st_uid != 0)
-        die_msg("daemon socket directory not owned by root");
+    if (st.st_uid != daemon_uid)
+        die_msg("daemon socket directory not owned by " BRIDGE_USER);
     if (st.st_mode & (S_IWGRP | S_IWOTH))
         die_msg("daemon socket directory is group- or world-writable");
 
@@ -163,8 +164,8 @@ check_daemon_socket(const char *path)
         die_msg("daemon socket is a symlink");
     if (!S_ISSOCK(st.st_mode))
         die_msg("daemon socket is not a socket");
-    if (st.st_uid != 0)
-        die_msg("daemon socket not owned by root");
+    if (st.st_uid != daemon_uid)
+        die_msg("daemon socket not owned by " BRIDGE_USER);
 }
 
 /* ---------------------------------------------------------------------------
@@ -451,11 +452,11 @@ main(int argc, char *argv[])
     pw_copy.pw_gid  = target_gid;
 
     /* ---- 5. Validate daemon socket -------------------------------------- */
-    /* Done while still root so lstat() on a tight-permission directory
-     * succeeds, and so the TOCTOU window is bounded: after this check only
-     * root can replace something in /run/vnctlsd (enforced by the dir-owner
-     * check inside). */
-    check_daemon_socket(DAEMON_SOCKET);
+    /* Done before drop_privs so lstat() on a tight-permission directory
+     * succeeds (as euid=root from setuid bit), and so the TOCTOU window is
+     * bounded: after this check only _vnctlsd can replace something in
+     * /run/vnctlsd (enforced by the dir-owner check inside). */
+    check_daemon_socket(DAEMON_SOCKET, bridge_pw->pw_uid);
 
     /* ---- 6. Drop privileges to target user ------------------------------ */
     /* Effective root (from the setuid bit) is consumed here and here only.

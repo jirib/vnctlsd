@@ -280,22 +280,6 @@ def run_monitor(rpc_sock: socket.socket, push_sock: socket.socket,
                                         'seq': msg.get('seq')})
                     continue
 
-                run_as_name = defn.get(
-                    'run_as',
-                    config.get('spawn', 'run_as', fallback='_vnctlsd')
-                    if config.has_option('spawn', 'run_as')
-                    else '_vnctlsd',
-                )
-
-                try:
-                    pw = pwd.getpwnam(run_as_name)
-                except KeyError:
-                    log.error("SPAWN_REQ: unknown run_as %r", run_as_name)
-                    ipc_send(rpc_sock, {'type': 'SPAWN_RESP', 'ok': False,
-                                        'error': f"unknown user {run_as_name!r}",
-                                        'seq': msg.get('seq')})
-                    continue
-
                 import pty as _pty
                 cmd = shlex.split(cmd_str)
                 try:
@@ -305,9 +289,6 @@ def run_monitor(rpc_sock: socket.socket, push_sock: socket.socket,
                         try:
                             import fcntl as _fcntl
                             os.close(master_fd)
-                            os.setgroups([])
-                            os.setgid(pw.pw_gid)
-                            os.setuid(pw.pw_uid)
                             os.setsid()
                             _fcntl.ioctl(slave_fd, 0x540E, 0)  # TIOCSCTTY
                             for fd in (0, 1, 2):
@@ -319,8 +300,8 @@ def run_monitor(rpc_sock: socket.socket, push_sock: socket.socket,
                         os._exit(1)
 
                     os.close(slave_fd)
-                    log.info("Spawned: console=%r cmd=%r pid=%d user=%r",
-                             console_name, cmd_str, child, run_as_name)
+                    log.info("Spawned: console=%r cmd=%r pid=%d",
+                             console_name, cmd_str, child)
                     ipc_send(rpc_sock, {'type': 'SPAWN_RESP', 'ok': True,
                                         'pid': child,
                                         'seq': msg.get('seq')},

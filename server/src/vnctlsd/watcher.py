@@ -2,7 +2,6 @@ import ctypes
 import ctypes.util
 import logging
 import os
-import pwd
 import select
 import socket
 import struct
@@ -28,18 +27,12 @@ _INOTIFY_EVENT = struct.Struct('iIII')  # wd, mask, cookie, len
 
 def run_watcher(ctl_sock: socket.socket, watch_sock: socket.socket,
                 console_store: ConsoleConfigStore,
-                watcher_pw: pwd.struct_passwd,
                 no_seccomp: bool = False,
                 no_landlock: bool = False):
-    set_proc_title(f"watcher ({watcher_pw.pw_name})")
+    set_proc_title("watcher")
     for h in logging.getLogger().handlers:
         h.setLevel(logging.NOTSET)
-    log.info("Watcher started (pid=%d), dropping to %r",
-             os.getpid(), watcher_pw.pw_name)
-
-    os.setgroups([])
-    os.setgid(watcher_pw.pw_gid)
-    os.setuid(watcher_pw.pw_uid)
+    log.info("Watcher started (pid=%d uid=%d)", os.getpid(), os.getuid())
 
     # Pre-resolve libc before applying landlock/seccomp.
     # ctypes.util.find_library() internally tries to create a temp file

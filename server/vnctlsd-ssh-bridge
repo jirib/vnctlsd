@@ -19,6 +19,7 @@ the authenticated user's uid.  No credential or claim is sent by this command
 """
 import argparse
 import os
+import pwd
 import select
 import socket
 import stat
@@ -53,8 +54,12 @@ def _check_socket(path: str) -> str | None:
         return "is a symlink"
     if not stat.S_ISSOCK(st.st_mode):
         return "not a socket"
-    if st.st_uid != 0:
-        return f"not owned by root (owner uid={st.st_uid})"
+    try:
+        daemon_uid = pwd.getpwnam('_vnctlsd').pw_uid
+    except KeyError:
+        return "daemon account '_vnctlsd' not found on this system"
+    if st.st_uid != daemon_uid:
+        return f"not owned by _vnctlsd (owner uid={st.st_uid})"
 
     return None
 

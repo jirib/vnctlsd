@@ -82,11 +82,11 @@ A small C binary.  Its startup sequence is strictly ordered:
 3. **User resolution** — `getpwnam(username)` to obtain uid/gid.  Resolving
    to uid 0 is rejected.
 4. **Socket validation** — `lstat(DAEMON_SOCKET)` verifies the socket is not
-   a symlink, is owned by root, and lives in a root-owned, non-writable
-   directory.  Done while still root so tight directory permissions do not
-   block the check, and done before connecting to bound the TOCTOU window: a
-   root-owned parent directory means only root can replace the socket after
-   this check.
+   a symlink, is owned by `_vnctlsd`, and lives in a `_vnctlsd`-owned,
+   non-writable directory.  Done while still euid=root (setuid bit) so tight
+   directory permissions do not block the check, and done before connecting to
+   bound the TOCTOU window: a `_vnctlsd`-owned parent directory means only
+   `_vnctlsd` can replace the socket after this check.
 5. **Privilege drop** — `setgroups()` → `setgid()` → `setuid()`.  Effective
    root from the setuid bit is consumed here and nowhere else.
 6. **Verification** — `setuid(0)` must return `EPERM`.  If it succeeds, the

@@ -1,8 +1,6 @@
 DEFAULT_CONFIG = """
 [core]
 socket_path      = /run/vnctlsd/vnctlsd.sock
-worker_user      = _vnctlsd
-watcher_user     = _vnctlsd
 pidfile          = /run/vnctlsd/vnctlsd.pid
 max_threads      = 64
 hub_grace_period = 30

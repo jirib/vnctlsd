@@ -597,18 +597,12 @@ def run_worker(rpc_sock: socket.socket, push_sock: socket.socket,
                config: configparser.ConfigParser,
                user_map: UserMapStore,
                console_store: ConsoleConfigStore,
-               worker_pw,
                no_seccomp: bool = False,
                no_landlock: bool = False):
-    set_proc_title(f"worker ({worker_pw.pw_name})")
+    set_proc_title("worker")
     for h in logging.getLogger().handlers:
         h.setLevel(logging.NOTSET)
-    log.info("Worker started (pid=%d), dropping to %r",
-             os.getpid(), worker_pw.pw_name)
-
-    os.setgroups([])
-    os.setgid(worker_pw.pw_gid)
-    os.setuid(worker_pw.pw_uid)
+    log.info("Worker started (pid=%d uid=%d)", os.getpid(), os.getuid())
 
     socket_path = config.get('core', 'socket_path')
     max_threads = config.getint('core', 'max_threads', fallback=64)

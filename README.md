@@ -25,10 +25,10 @@ provided for Windows compatibility.
   keystrokes and displays raw output. No protocol knowledge required.
 - **Console fan-out** — multiple users can attach to the same VM console
   simultaneously. Read-write users type; read-only users watch.
-- **Privilege separation** — three processes with distinct trust levels:
-  - **monitor** (root): spawns configured console commands, runs management
-    commands, resolves uid→username for the worker — never touches the
-    network socket
+- **Privilege separation** — three processes with distinct responsibilities:
+  - **monitor** (`_vnctlsd`): spawns configured console commands, runs
+    management commands, resolves uid→username for the worker — never
+    touches the network socket
   - **worker** (`_vnctlsd`): network socket, client sessions, console hubs
     — never forks, never execs, never touches arbitrary files
   - **watcher** (`_vnctlsd`): inotify on the socket directory, validates
@@ -86,14 +86,14 @@ provided for Windows compatibility.
 
 ```
                         ┌─────────────────────────────────────┐
-                        │           master (root)             │
+                        │        master (_vnctlsd)            │
                         │  startup, socket creation, fork x3  │
                         └──────────────┬──────────────────────┘
                                        │ fork
               ┌────────────────────────┼────────────────────────┐
               │                        │                        │
     ┌─────────▼──────────┐  ┌──────────▼─────────┐  ┌─────────▼──────────┐
-    │   monitor (root)   │  │  worker(_vnctlsd)  │  │ watcher(_vnctlsd)  │
+    │ monitor(_vnctlsd)  │  │  worker(_vnctlsd)  │  │ watcher(_vnctlsd)  │
     │                    │  │                    │  │                    │
     │ console spawn      │  │ unix socket        │  │ inotify watch dir  │
     │ management cmds    │  │ client sessions    │  │ lstat validation   │
@@ -199,22 +199,25 @@ pip install tomli
 ### Service accounts
 
 ```bash
-# Worker and watcher account
+# Daemon account (all three processes run as this user)
 useradd --system --no-create-home --home-dir /nonexistent \
-        --shell /sbin/nologin --comment "vnctlsd worker" _vnctlsd
+        --shell /sbin/nologin --comment "vnctlsd daemon" _vnctlsd
 
 # Socket group (allows ghostunnel/stunnel to connect)
 groupadd --system _vnctlsd
 usermod -aG _vnctlsd _vnctlsd
 
-# Allow worker to run virsh management commands
+# Allow daemon to run virsh management commands
 usermod -aG libvirt _vnctlsd
 ```
 
 ### Socket directory
 
+With systemd the runtime directory is created automatically via
+`RuntimeDirectory=vnctlsd` in the service unit. For manual setup:
+
 ```bash
-install -d -o root -g _vnctlsd -m 0750 /run/vnctlsd
+install -d -o _vnctlsd -g _vnctlsd -m 0750 /run/vnctlsd
 ```
 
 The watcher refuses to watch a world-writable directory — it would allow
@@ -245,10 +248,6 @@ GOOS=darwin GOARCH=amd64 go build -o vnctl-macos vnctl.go
 ```ini
 [core]
 socket_path      = /run/vnctlsd/vnctlsd.sock
-socket_mode      = 0660
-socket_group     = _vnctlsd
-worker_user      = _vnctlsd
-watcher_user     = _vnctlsd
 pidfile          = /run/vnctlsd/vnctlsd.pid
 max_threads      = 64
 hub_grace_period = 30       # seconds hub stays alive after last client leaves
@@ -259,6 +258,11 @@ idle_timeout     = 300      # seconds idle at prompt before disconnect
 max_failures     = 5        # failed logins before lockout
 lockout_duration = 60       # seconds locked out after max_failures
 failure_window   = 120      # seconds over which failures are counted
+
+[logging]
+master_log       = /var/log/vnctlsd/master.log
+worker_log       = /var/log/vnctlsd/worker.log
+watcher_log      = /var/log/vnctlsd/watcher.log
 ```
 
 ### `users.yaml`
@@ -307,7 +311,6 @@ defaults:
   console:
     type: exec
     cmd: "virsh -c qemu:///system console {name} --force"
-    run_as: _vnctlsd
 
 # Management commands — config-driven, validated by monitor before execution
 # {name} is substituted with the console name (validated against VM_NAME_RE)
@@ -433,6 +436,63 @@ connect to an untrusted socket.
 
 ---
 
+## Logging
+
+### Log directory
+
+```bash
+install -d -o _vnctlsd -g _vnctlsd -m 0750 /var/log/vnctlsd
+```
+
+`open_log_fd()` rejects log directories that are group- or world-writable.
+
+### Per-component log files
+
+Each component writes to its own append-only JSONL log file. The master
+process opens all log files before forking; children inherit the pre-opened
+file descriptors and **never open a log path themselves**. Log fds carry
+`O_CLOEXEC` so console commands spawned by the monitor (virsh, etc.) do not
+inherit them.
+
+| Component | File              | Trust level  |
+|-----------|-------------------|--------------|
+| master    | `master.log`      | authoritative |
+| worker    | `worker.log`      | diagnostic   |
+| watcher   | `watcher.log`     | diagnostic   |
+
+### Log record format
+
+One JSON object per line (JSONL), written in a single `write()` call:
+
+```json
+{"ts":"2026-06-16T13:22:11.123456Z","seq":42,"level":"INFO","component":"master","pid":1234,"logger":"vnctlsd.monitor","msg":"Session created: user=jiri console=vm-lab01"}
+```
+
+Fields: `ts` (UTC ISO-8601 µs), `seq` (per-component counter), `level`,
+`component`, `pid`, `logger` (Python logger name), `msg`. Records that
+exceed 64 KB have their `msg` and `exc` fields shortened and carry
+`"truncated": true`.
+
+### Rotation
+
+Log rotation is not yet implemented. To rotate logs, restart the daemon:
+
+```bash
+systemctl restart vnctlsd
+```
+
+A future version will send new log fds to running children via SCM_RIGHTS on
+SIGHUP so rotation does not require a full daemon restart.
+
+### Fallback to stderr
+
+If a log path is not configured in `[logging]`, that component continues
+logging to stderr. This is the default when no `[logging]` section exists.
+Note that startup messages (config load, user map load) are always emitted
+on stderr before the log files are opened; this is a known limitation.
+
+---
+
 ## QEMU console socket setup
 
 Configure each VM to bind a per-VM unix socket at boot. QEMU creates and
@@ -492,7 +552,7 @@ CAfile  = /etc/vnctlsd/ca.crt
 ## Running
 
 ```bash
-# Start (must be root)
+# Start (as _vnctlsd — must NOT be root)
 python3 vnctlsd.py \
   --config   /etc/vnctlsd/vnctlsd.ini \
   --users    /etc/vnctlsd/users.yaml \
@@ -528,6 +588,8 @@ After=network.target libvirtd.service
 
 [Service]
 Type=forking
+User=_vnctlsd
+Group=_vnctlsd
 PIDFile=/run/vnctlsd/vnctlsd.pid
 ExecStart=/usr/bin/python3 /usr/local/sbin/vnctlsd.py \
     --config   /etc/vnctlsd/vnctlsd.ini \
@@ -634,13 +696,13 @@ While attached to a console:
 
 | Process   | User         | Capabilities                                              |
 |-----------|--------------|-----------------------------------------------------------|
-| monitor   | root         | fork+exec configured console commands, management commands, uid→username lookup |
+| monitor   | `_vnctlsd`   | fork+exec configured console commands, management commands, uid→username lookup |
 | worker    | `_vnctlsd`   | Unix socket accept, client I/O, no exec/fork              |
 | watcher   | `_vnctlsd`   | inotify read, lstat only — no network, no write           |
 
-The monitor is the only process that ever runs as root and it has no network
-socket access. The worker has network access but cannot fork, exec, or open
-arbitrary files (enforced by seccomp and landlock).
+All three processes run as `_vnctlsd`. The separation is enforced by seccomp
+and landlock, not uid boundaries. The monitor has no network socket access.
+The worker has network access but cannot fork, exec, or open arbitrary files.
 
 ### Authentication outside the daemon
 
@@ -680,7 +742,7 @@ The monitor:
 3. Builds the command from its own template, not from the worker's message
 4. Processes output through the format+filter pipeline before sending back
 
-A compromised worker cannot cause the monitor to run arbitrary commands as root.
+A compromised worker cannot cause the monitor to run arbitrary commands.
 
 ### Output processing pipeline
 
@@ -709,6 +771,39 @@ Before connecting to any QEMU unix socket:
 
 The worker re-validates independently after receiving events from the watcher.
 A compromised watcher cannot force the worker to connect to an untrusted socket.
+
+### Logging security model
+
+**Append-only semantics** are enforced by opening log files with `O_APPEND`
+and (in a future hardening pass) denying `lseek`, `pwrite64`, `ftruncate`,
+and `truncate` in the worker/watcher seccomp profiles. A process holding a
+log fd can append records but cannot seek backwards or truncate history.
+
+**Two trust levels:**
+
+- **master log** — authoritative. The monitor records decisions it made
+  directly: auth allow/deny, session creation/destruction, spawn, uid
+  lookups, policy violations. These records are trustworthy because the
+  monitor controls the resources and observed the events itself.
+- **worker/watcher logs** — diagnostic only. A compromised component can
+  write arbitrary bytes to its own log fd. Append-only prevents rewriting
+  history but does not prevent future lies, omissions, or spam. Treat these
+  logs as operational telemetry useful for debugging, not as a security audit
+  trail.
+
+**Known limitations:**
+
+- All processes share the same uid (`_vnctlsd`), so filesystem permissions do
+  not prevent a compromised component from accessing another component's log
+  fd if it were leaked. Correct fd separation (children close unneeded fds
+  immediately after fork) is the enforcement mechanism.
+- A logging broker process — where workers send events over a pipe and only
+  the broker holds the file fd — would give stronger framing guarantees but
+  adds complexity. The current design is a deliberate tradeoff: simpler
+  implementation, honest acknowledgement that worker logs are untrusted.
+- Even append-only master logs cannot prevent a compromised monitor from
+  stopping future log writes. Append-only protects the integrity of history
+  before compromise, not truthfulness after it.
 
 ### Directory permissions
 
@@ -775,7 +870,7 @@ VM name gets read-write access automatically.
 **Why is authentication outside the daemon?**
 
 The daemon runs as `_vnctlsd` and has no way to verify passwords or SSH keys
-itself without either running as root or trusting client-supplied claims.
+itself without trusting client-supplied claims.
 Delegating authentication to bridges keeps the daemon's trust model simple:
 it trusts only the kernel-reported uid from `SO_PEERCRED`.
 
@@ -788,11 +883,22 @@ This mirrors OpenSSH's privilege separation approach.
 **Why does the monitor validate commands instead of trusting the worker?**
 
 The worker is the network-facing process — the most likely target for
-exploitation. If the worker is compromised, it should not be able to cause
-the root monitor to execute arbitrary commands. By validating `{action,
-console_name}` against its own config and building the command itself, the
-monitor ensures it only ever runs what was explicitly configured, regardless
-of what the worker sends.
+exploitation. If the worker is compromised, it should not be able to cause the monitor to
+execute arbitrary commands. By validating `{action, console_name}` against
+its own config and building the command itself, the monitor ensures it only
+ever runs what was explicitly configured, regardless of what the worker sends.
+
+**Why per-component log files instead of a central logging broker?**
+
+A broker process (workers send events over a pipe; only the broker holds the
+file fd) would prevent a compromised worker from writing arbitrary bytes to
+the log file. However, it would not prevent a compromised worker from sending
+false event content to the broker — the broker appends what it receives. The
+security gain is framing integrity, not content truthfulness.
+
+The current design is simpler and honest about the trust boundary: worker
+logs are explicitly diagnostic/untrusted, the monitor log is authoritative.
+A broker can be added later if framing integrity becomes a requirement.
 
 **Why a format+filter output pipeline?**
 
@@ -815,10 +921,15 @@ only config changes, no code changes.
   server.key        TLS private key
   ca.crt            CA certificate
 
-/run/vnctlsd/       runtime directory (root:_vnctlsd, mode 0750)
+/run/vnctlsd/       runtime directory (_vnctlsd:_vnctlsd, mode 0750)
   vnctlsd.sock      client-facing unix socket (ghostunnel connects here)
   vnctlsd.pid       monitor PID
   console-*.sock    QEMU serial console sockets (created by QEMU at VM boot)
+
+/var/log/vnctlsd/   log directory (_vnctlsd:_vnctlsd, mode 0750)
+  master.log        authoritative audit log (auth decisions, sessions, spawns)
+  worker.log        diagnostic log (client I/O, protocol traces)
+  watcher.log       diagnostic log (inotify events, socket validation)
 
 /usr/local/sbin/
   vnctlsd.py        daemon (~2900 lines, Python 3.11+)
@@ -839,6 +950,13 @@ only config changes, no code changes.
 - No VNC/SPICE console support (serial consoles only)
 - No multi-host support (single daemon instance per host)
 - No session logging / console output capture to file (planned)
+- Log rotation requires a daemon restart; fd-passing via SCM_RIGHTS on SIGHUP
+  is planned but not yet implemented
+- Startup messages (config/user/console load) always go to stderr regardless
+  of `[logging]` configuration — log files are opened after config is parsed
+- Worker and watcher logs are diagnostic only; a compromised component can
+  write arbitrary content to its own log fd (see Security → Logging security
+  model for rationale and limitations)
 - LDAP/AD backend for user map not yet implemented (the `ACLResolver`
   abstraction is in place; `FileACLResolver` is the only current backend)
 - `qemu_unix` console patterns require QEMU to be configured to use unix

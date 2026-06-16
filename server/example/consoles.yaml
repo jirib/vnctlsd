@@ -16,7 +16,6 @@ defaults:
   console:
     type: exec
     cmd: "virsh -c qemu:///system console {name} --force"
-    run_as: _vnctlsd
 
 # ---------------------------------------------------------------------------
 # Management commands

@@ -2,12 +2,12 @@ import argparse
 import configparser
 import logging
 import os
-import pwd
 import socket
 import sys
 
 from .config import ConsoleConfigStore, UserMapStore, load_console_config, load_user_map
 from .constants import DEFAULT_CONFIG
+from .logger import close_fd, install_log_handler, open_log_fd
 from .monitor import run_monitor
 from .process import set_proc_title
 from .watcher import run_watcher
@@ -17,8 +17,8 @@ log = logging.getLogger(__name__)
 
 
 def main():
-    if os.geteuid() != 0:
-        print("[ERROR] must be started as root", file=sys.stderr)
+    if os.geteuid() == 0:
+        print("[ERROR] must not be started as root", file=sys.stderr)
         sys.exit(1)
 
     set_proc_title("master")
@@ -76,19 +76,9 @@ def main():
 
     console_store = ConsoleConfigStore(console_cfg)
 
-    worker_pw = watcher_pw = None
-    for role_name, key in [('worker', 'worker_user'),
-                            ('watcher', 'watcher_user')]:
-        uname = config.get('core', key, fallback='_vnctlsd')
-        try:
-            pw = pwd.getpwnam(uname)
-            if role_name == 'worker':
-                worker_pw = pw
-            else:
-                watcher_pw = pw
-        except KeyError:
-            log.error("%s user %r not found", role_name, uname)
-            sys.exit(1)
+    master_log_fd  = open_log_fd(config.get('logging', 'master_log',  fallback=None))
+    worker_log_fd  = open_log_fd(config.get('logging', 'worker_log',  fallback=None))
+    watcher_log_fd = open_log_fd(config.get('logging', 'watcher_log', fallback=None))
 
     socket_path = config.get('core', 'socket_path')
     socket_dir = os.path.dirname(socket_path)
@@ -104,7 +94,6 @@ def main():
     trusted_sock.bind(socket_path)
     trusted_sock.listen(128)
     os.chmod(socket_path, 0o666)
-    os.chown(socket_path, 0, 0)
     log.info("Socket: %s", socket_path)
 
     # rpc:   worker ↔ monitor (AUTH, CMD, SPAWN)
@@ -133,19 +122,25 @@ def main():
 
     watcher_pid = os.fork()
     if watcher_pid == 0:
+        close_fd(master_log_fd)
+        close_fd(worker_log_fd)
+        install_log_handler(watcher_log_fd, 'watcher', debug=args.debug)
         rpc_m.close(); rpc_w.close()
         push_m.close(); push_w.close()
         watch_worker.close()
         trusted_sock.close()
         os.setsid()
 
-        run_watcher(ctl_w, watch_w2, console_store, watcher_pw,
+        run_watcher(ctl_w, watch_w2, console_store,
                     no_seccomp=args.no_seccomp or args.no_privsep,
                     no_landlock=args.no_landlock or args.no_privsep)
         os._exit(0)
 
     worker_pid = os.fork()
     if worker_pid == 0:
+        close_fd(master_log_fd)
+        close_fd(watcher_log_fd)
+        install_log_handler(worker_log_fd, 'worker', debug=args.debug)
         rpc_m.close()
         push_m.close()
         ctl_m.close(); ctl_w.close()
@@ -153,7 +148,7 @@ def main():
         os.setsid()
 
         run_worker(rpc_w, push_w, watch_worker, trusted_sock,
-                   config, user_map, console_store, worker_pw,
+                   config, user_map, console_store,
                    no_seccomp=args.no_seccomp or args.no_privsep,
                    no_landlock=args.no_landlock or args.no_privsep)
         os._exit(0)
@@ -164,6 +159,9 @@ def main():
     watch_w2.close()
     watch_worker.close()
     trusted_sock.close()
+    close_fd(worker_log_fd)
+    close_fd(watcher_log_fd)
+    install_log_handler(master_log_fd, 'master', debug=args.debug)
 
     if pidfile:
         try:
