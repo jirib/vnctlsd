@@ -26,15 +26,23 @@ provided for Windows compatibility.
 - **Console fan-out** — multiple users can attach to the same VM console
   simultaneously. Read-write users type; read-only users watch.
 - **Privilege separation** — three processes with distinct trust levels:
-  - **monitor** (root): PAM authentication, virsh spawning, management
-    commands — never touches the network socket
+  - **monitor** (root): spawns configured console commands, runs management
+    commands, resolves uid→username for the worker — never touches the
+    network socket
   - **worker** (`_vnctlsd`): network socket, client sessions, console hubs
     — never forks, never execs, never touches arbitrary files
   - **watcher** (`_vnctlsd`): inotify on the socket directory, validates
     QEMU unix sockets as they appear — no network access, read-only fs
-- **PAM authentication in isolated subprocesses** — each auth attempt forks
-  a short-lived child. Password memory is freed by the OS on exit and never
-  persists in the long-lived monitor process.
+- **Authentication via dedicated bridges** — the daemon itself does not
+  handle passwords or SSH keys. Two separate bridge programs cover access:
+  - **PAM bridge** (`vnctlsd-pam-bridge`) — drives the password prompt,
+    verifies credentials in a short-lived grandchild so the plaintext
+    password is freed when that child exits, then execs `vnctl-user-pipe`
+    (a setuid helper) to connect to the daemon as the authenticated user.
+  - **SSH bridge** (`vnctlsd-ssh-bridge`) — a command installed in PATH on
+    the server. Users run `ssh <host> vnctlsd-ssh-bridge`; sshd handles all
+    authentication and drops to the user's uid before exec. No sshd_config
+    changes required.
 - **landlock + seccomp** — each process is restricted to the minimal
   filesystem paths and syscalls it actually needs, applied after privilege
   drop and after all library resolution.
@@ -87,12 +95,12 @@ provided for Windows compatibility.
     ┌─────────▼──────────┐  ┌──────────▼─────────┐  ┌─────────▼──────────┐
     │   monitor (root)   │  │  worker(_vnctlsd)  │  │ watcher(_vnctlsd)  │
     │                    │  │                    │  │                    │
-    │ PAM subprocess     │  │ unix socket        │  │ inotify watch dir  │
-    │ virsh spawn        │  │ client sessions    │  │ lstat validation   │
-    │ management cmds    │  │ ConsoleHub fan-out │  │ glob pattern match │
+    │ console spawn      │  │ unix socket        │  │ inotify watch dir  │
+    │ management cmds    │  │ client sessions    │  │ lstat validation   │
+    │ uid→name lookup    │  │ ConsoleHub fan-out │  │ glob pattern match │
     │ config reload      │  │ ACL enforcement    │  │                    │
-    │ SIGHUP/USR1/USR2   │  │ rate limiting      │  │ landlock: ro only  │
-    │                    │  │ output pipeline    │  │ seccomp: inotify   │
+    │ SIGHUP/USR1/USR2   │  │ output pipeline    │  │ landlock: ro only  │
+    │                    │  │                    │  │ seccomp: inotify   │
     └────────┬───────────┘  └──────────┬─────────┘  └─────────┬──────────┘
              │    rpc socketpair        │                       │
              │◄────────────────────────►│                       │
@@ -108,7 +116,7 @@ provided for Windows compatibility.
 
 | Name    | Direction          | Purpose                                      |
 |---------|--------------------|----------------------------------------------|
-| `rpc`   | worker ↔ monitor   | AUTH_REQ, CMD_REQ, SPAWN_REQ + responses     |
+| `rpc`   | worker ↔ monitor   | CMD_REQ, SPAWN_REQ, PEERCRED_LOOKUP_REQ + responses |
 | `push`  | monitor → worker   | SESSION_LIST_REQ, ENFORCE_REQ                |
 | `ctl`   | monitor ↔ watcher  | RELOAD_WATCH, WATCHER_READY, WATCHER_ERROR   |
 | `watch` | watcher → worker   | SOCKET_APPEARED, SOCKET_DISAPPEARED          |
@@ -150,8 +158,9 @@ in its own config.
 ```
 user types 'console vm-lab01'
   → worker sends SPAWN_REQ to monitor
-    → monitor fork+setuid+exec virsh console vm-lab01
-      → monitor sends pty master fd to worker via SCM_RIGHTS
+    → monitor looks up 'vm-lab01' in consoles.yaml, builds configured exec cmd
+      → monitor fork+exec [configured command, e.g. virsh console vm-lab01]
+        → monitor sends pty master fd to worker via SCM_RIGHTS
         → worker creates ConsoleHub(vm-lab01, master_fd)
           → hub reader thread broadcasts pty output to all clients
             → read-write client feeds keystrokes back
@@ -623,25 +632,34 @@ While attached to a console:
 
 ### Privilege separation
 
-| Process   | User         | Capabilities                                       |
-|-----------|--------------|----------------------------------------------------|
-| monitor   | root         | PAM, fork+setuid for virsh, management commands    |
-| worker    | `_vnctlsd`   | Unix socket accept, client I/O, no exec/fork       |
-| watcher   | `_vnctlsd`   | inotify read, lstat only — no network, no write    |
+| Process   | User         | Capabilities                                              |
+|-----------|--------------|-----------------------------------------------------------|
+| monitor   | root         | fork+exec configured console commands, management commands, uid→username lookup |
+| worker    | `_vnctlsd`   | Unix socket accept, client I/O, no exec/fork              |
+| watcher   | `_vnctlsd`   | inotify read, lstat only — no network, no write           |
 
 The monitor is the only process that ever runs as root and it has no network
 socket access. The worker has network access but cannot fork, exec, or open
 arbitrary files (enforced by seccomp and landlock).
 
-### PAM in isolated subprocesses
+### Authentication outside the daemon
 
-Each login attempt forks a short-lived child that:
+The daemon does not handle passwords or keys. Authentication is delegated to
+dedicated bridge processes that connect to the world-connectable Unix socket;
+the daemon identifies callers via `SO_PEERCRED` (kernel-reported uid) only.
+
+**PAM bridge** — each login attempt forks a short-lived grandchild that:
 - Sets `PR_SET_NO_NEW_PRIVS`
 - Limits itself to 0 further processes (`RLIMIT_NPROC=0`)
 - Runs PAM, writes one byte result to a pipe, exits immediately
 
-The password never enters the long-lived monitor's heap. The OS frees the
-child's memory on exit — no GC delay, no retention.
+The password never enters the long-lived bridge process's heap. On auth
+success the bridge execs `vnctl-user-pipe` (a setuid helper), which drops to
+the authenticated user's uid before connecting to the daemon.
+
+**SSH bridge** — sshd handles all authentication (keys, certificates, MFA)
+and drops to the authenticated user's uid before exec'ing `vnctlsd-ssh-bridge`.
+The bridge is a plain pipe; it sends no credential to the daemon.
 
 ### Constant-time login responses
 
@@ -754,12 +772,18 @@ blocks. A single pattern `/run/vnctlsd/console-{name}.sock` with
 `rw: ["{name}"]` covers all of them: the student whose username matches the
 VM name gets read-write access automatically.
 
-**Why PAM in a subprocess?**
+**Why is authentication outside the daemon?**
 
-Python has no `explicit_bzero` equivalent. Passwords in Python strings remain
-in heap memory until GC — which may be never for a long-lived daemon. A
-subprocess whose only job is PAM has its entire memory freed by the OS on
-exit, regardless of GC. This mirrors OpenSSH's privilege separation approach.
+The daemon runs as `_vnctlsd` and has no way to verify passwords or SSH keys
+itself without either running as root or trusting client-supplied claims.
+Delegating authentication to bridges keeps the daemon's trust model simple:
+it trusts only the kernel-reported uid from `SO_PEERCRED`.
+
+For PAM specifically: Python has no `explicit_bzero` equivalent. Passwords in
+Python strings remain in heap memory until GC — which may be never for a
+long-lived process. Running PAM in a short-lived grandchild of the bridge
+ensures the password memory is freed by the OS on exit, regardless of GC.
+This mirrors OpenSSH's privilege separation approach.
 
 **Why does the monitor validate commands instead of trusting the worker?**
 
