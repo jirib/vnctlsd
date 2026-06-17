@@ -53,7 +53,7 @@ func runSSH(server, sshBin, extraArgs string) {
 	argv = append(argv, server, "vnctlsd-ssh-bridge")
 
 	cmd := exec.Command(sshBin, argv...)
-	cmd.Stdin  = os.Stdin
+	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 

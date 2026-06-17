@@ -25,20 +25,24 @@ import (
 )
 
 func main() {
-	// SSH-mode flags are intentionally omitted from the default usage output.
-	// They are available but not advertised; see ssh.go for details.
-	mode     := flag.String("mode", "tls", "")
-	server   := flag.String("server", "localhost:8443", "server `address` (host:port for tls, [user@]host for ssh)")
+	mode := flag.String("mode", "tls", "connection mode: tls or ssh")
+	server := flag.String("server", "localhost:8443", "server `address` (host:port for tls, [user@]host for ssh)")
 	insecure := flag.Bool("insecure", false, "skip TLS certificate verification")
-	certFile := flag.String("cert", "", "client certificate `file` (PEM)")
-	keyFile  := flag.String("key",  "", "client key `file` (PEM)")
-	caFile   := flag.String("ca",   "", "CA certificate `file` (PEM) for server verification")
-	sshBin  := flag.String("ssh-bin",  defaultSSHBin, "")
-	sshArgs := flag.String("ssh-args", "",            "")
+	certFile := flag.String("cert", "", "client certificate `file` (PEM) for TLS client authentication")
+	keyFile := flag.String("key", "", "client key `file` (PEM) for TLS client authentication")
+	caFile := flag.String("ca", "", "CA certificate `file` (PEM) for server verification")
+	proxy := flag.String("proxy", "", "proxy URL for TLS mode ([http://|https://]host[:port]); NO_PROXY still applies")
+	insecureProxy := flag.Bool("insecure-proxy", false, "skip TLS certificate verification for an https:// proxy (does not affect verification of the target server)")
+	verbose := flag.Bool("verbose", false, "print TLS handshake and certificate details")
+	sshBin := flag.String("ssh-bin", defaultSSHBin, "SSH binary for -mode ssh")
+	sshArgs := flag.String("ssh-args", "", "extra SSH arguments for -mode ssh, e.g. \"-p 2222 -J bastion\"")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags]\n\nFlags:\n", os.Args[0])
-		for _, name := range []string{"server", "insecure", "cert", "key", "ca"} {
+		for _, name := range []string{
+			"mode", "server", "insecure", "cert", "key", "ca",
+			"proxy", "insecure-proxy", "verbose", "ssh-bin", "ssh-args",
+		} {
 			if f := flag.Lookup(name); f != nil {
 				fmt.Fprintf(os.Stderr, "  -%-10s %s\n", f.Name, f.Usage)
 			}
@@ -49,7 +53,7 @@ func main() {
 
 	switch *mode {
 	case "tls":
-		runTLS(*server, *insecure, *certFile, *keyFile, *caFile)
+		runTLS(*server, *insecure, *certFile, *keyFile, *caFile, *proxy, *insecureProxy, *verbose)
 	case "ssh":
 		runSSH(*server, *sshBin, *sshArgs)
 	default:
